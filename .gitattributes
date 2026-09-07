@@ -1,0 +1,5 @@
+# 保证 CI 脚本与工作流文件在 Windows 检出时保持 LF 换行
+* text=auto
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

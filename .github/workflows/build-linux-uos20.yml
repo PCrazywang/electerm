@@ -1,0 +1,297 @@
+# =====================================================================
+# electerm 多架构 legacy 构建工作流 (UOS 20 / Ubuntu 兼容)
+# ---------------------------------------------------------------------
+# 参考 mysql 项目的 build-linux-uos20.yml 结构:
+#   1) build        原生 runner + 固定 glibc 基线的构建容器, 产物上传 artifact
+#   2) verify-uos20 在 Debian 10 (与 UOS 20 同为 glibc 2.28 基线) 上安装并
+#                   运行冒烟, 验证产物真能在老系统上跑
+#   3) release      推 v* tag 时把产物发布为 GitHub Release
+#
+# 为什么用 legacy 构建: electerm 的 node-pty / serialport 原生模块在新系统
+# 编译会链接新版 glibc 符号, UOS 20 (glibc 2.28) 装不上; legacy 构建在
+# Ubuntu 18.04 (glibc 2.27) 环境把 electron 降到 22.3.27、node-pty 0.10.1、
+# serialport 10.5.0、vite 4, 产物对 glibc 的要求不高于 2.28。
+# 构建容器: 官方维护的多架构镜像 zxdong262/electerm-builder-legacy
+#           (Ubuntu 18.04 + Node 16 + Python 3.8 + GCC 8 + ruby/fpm)
+#
+# 产物格式: 每种架构 4 种 —— tar.gz / deb / rpm / AppImage
+#   x64   : *-linux-amd64-legacy.deb, *-linux-x64-legacy.tar.gz,
+#           *-linux-x86_64-legacy.rpm, *-linux-x86_64-legacy.AppImage
+#   arm64 : *-linux-arm64-legacy.deb / .tar.gz / .AppImage,
+#           *-linux-aarch64-legacy.rpm
+#   armv7l: *-linux-armv7l-legacy.deb / .tar.gz / .rpm / .AppImage
+#   (arm64 与 armv7l 在 arm64 矩阵任务中依次构建)
+# =====================================================================
+name: Linux electerm (UOS 20 compatible)
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      electerm_ref:
+        description: 'Electerm branch or tag to build, for example v2.10.26'
+        required: false
+        type: string
+      source_repo:
+        description: 'Source repository (owner/repo) to build, default official electerm/electerm'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELECTERM_REF: v2.10.26
+  # UOS 20 / Debian 10 / EL8 共享的 ABI 基线: glibc 2.28, libstdc++ (gcc 8) 3.4.25
+  MAX_GLIBC: '2.28'
+  MAX_GLIBCXX: '3.4.25'
+
+jobs:
+  build:
+    name: Build electerm ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runner: ubuntu-latest
+            machine: x86_64
+            build_script: x64
+          - platform: arm64
+            runner: ubuntu-22.04-arm
+            machine: aarch64
+            build_script: arm
+    runs-on: ${{ matrix.runner }}
+    # legacy 构建容器: Ubuntu 18.04 (glibc 2.27) + Node 16 + GCC 8 + fpm
+    container: zxdong262/electerm-builder-legacy:latest
+    timeout-minutes: 360
+    env:
+      PACKAGE_PLATFORM: ${{ matrix.platform }}
+
+    steps:
+      - name: Resolve build inputs
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs.electerm_ref }}
+        run: |
+          set -eu
+          ref="$ELECTERM_REF"
+          if [ -n "${INPUT_REF:-}" ]; then
+            ref="$INPUT_REF"
+          fi
+          echo "ELECTERM_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+
+      - name: Confirm UOS 20-compatible build baseline
+        run: |
+          set -eu
+          test "$(uname -m)" = "${{ matrix.machine }}"
+          # 构建容器 glibc 必须不高于 UOS 20 的 2.28 (此处为 2.27)
+          echo "build glibc: $(getconf GNU_LIBC_VERSION)"
+          node --version
+          python3 --version
+          gcc --version | head -n 1
+          fpm --version
+
+      - name: Clone electerm source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: ${{ inputs.source_repo || 'electerm/electerm' }}
+        run: |
+          set -eu
+          rm -rf build_src
+          git clone --depth 1 --branch "$ELECTERM_REF" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${SOURCE_REPO}.git" build_src
+          echo "--- 已检出 ---"
+          git -C build_src log -1 --oneline
+
+      - name: Build legacy packages (tar.gz/deb/rpm/AppImage)
+        env:
+          USE_SYSTEM_FPM: "true"
+          KEEP_FILE: "true"
+        run: |
+          bash ci/build-legacy.sh ${{ matrix.build_script }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: electerm-legacy-${{ matrix.platform }}
+          path: artifacts
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Check build status (fail the job on any error)
+        if: always()
+        run: |
+          set -eu
+          if [ ! -f build_status ]; then
+            echo "未找到构建状态文件，构建未正常执行"
+            exit 1
+          fi
+          status="$(cat build_status)"
+          if [ "$status" != "0" ]; then
+            echo "构建或 glibc 校验存在失败，请查看上方日志；已产出的包仍可下载"
+            exit 1
+          fi
+          echo "构建完成：全部目标已生成并通过 glibc 兼容性校验"
+
+  # 产物在构建容器里只做了静态校验, 这里在真实的 UOS 20 ABI 基线
+  # (Debian 10, glibc 2.28) 上安装并启动, 验证能真正跑起来。
+  verify-uos20:
+    name: Verify Debian 10 (UOS 20 ABI) ${{ matrix.platform }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            runner: ubuntu-latest
+            machine: x86_64
+            deb_pattern: '*linux-amd64-legacy.deb'
+          - platform: arm64
+            runner: ubuntu-22.04-arm
+            machine: aarch64
+            deb_pattern: '*linux-arm64-legacy.deb'
+    runs-on: ${{ matrix.runner }}
+    container: debian:10-slim
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Install Debian 10 runtime dependencies
+        run: |
+          set -eu
+          # buster 已归档, 改用 archive.debian.org 并关闭 Valid-Until 检查
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian-security buster/updates main' \
+            > /etc/apt/sources.list
+          printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99archive
+          apt-get -o Acquire::Check-Valid-Until=false update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils xvfb procps
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: electerm-legacy-${{ matrix.platform }}
+          path: dist
+
+      - name: Install the deb on the UOS 20 ABI baseline
+        run: |
+          set -eu
+          head -n 2 /etc/os-release
+          test "$(uname -m)" = "${{ matrix.machine }}"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+          deb="$(find . -name '${{ matrix.deb_pattern }}' | head -n 1)"
+          test -n "$deb"
+          echo "installing: $deb"
+          # apt 直接装本地 deb 并自动解析依赖 (libgtk-3, libnss3, libasound2 ...)
+          apt-get install -y --no-install-recommends "./${deb#./}"
+          test -x /opt/electerm/electerm
+
+      - name: Verify every ELF dependency resolves on Debian 10
+        run: |
+          set -eu
+          # 不止主程序: electron 自带的 .so 与 app.asar.unpacked 里的原生
+          # 模块 (.node, node-pty/serialport) 也逐一检查
+          missing=0
+          for f in $(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \)); do
+            [ -f "$f" ] || continue
+            if ldd "$f" 2>/dev/null | grep -q 'not found'; then
+              echo "Unresolved dependencies in $f" >&2
+              ldd "$f" | grep 'not found' >&2
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Smoke test (start electerm and read version)
+        run: |
+          set -eu
+          # 容器内以 root 运行需 --no-sandbox; xvfb 提供虚拟显示
+          out="$(timeout 90 xvfb-run -a /opt/electerm/electerm --no-sandbox --disable-gpu --version 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -E '[0-9]+\.[0-9]+\.[0-9]+' >/dev/null \
+            || { echo "electerm 未输出版本号，冒烟失败" >&2; exit 1; }
+
+  # 推 v* tag 时把已通过验证的产物发布为 GitHub Release
+  release:
+    name: Publish GitHub Release
+    needs: [build, verify-uos20]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: electerm-legacy-x64
+          path: dist/x64
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: electerm-legacy-arm64-armv7l
+          path: dist/arm64
+
+      - name: Guard against mismatched version tags
+        id: guard
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/}"
+          # 从产物 BUILD-INFO.txt 读取实际构建的 electerm 版本
+          version="$(grep -h '^electerm_version=' dist/*/BUILD-INFO.txt 2>/dev/null \
+            | head -n 1 | cut -d= -f2 || true)"
+          test -n "$version"
+          case "$tag" in
+            "v${version}") ;;
+            *) echo "Tag '${tag}' does not match built electerm version '${version}'; refusing to publish." >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh 通过 git remote 推断目标仓库, 本任务无 checkout, 用 GH_REPO 显式指定
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
+          ELECTERM_VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          set -eu
+          assets="$(find dist -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+            -o -name '*.tar.gz' -o -name 'SHA256SUMS.txt' \) | sort)"
+          test -n "$assets"
+          ls -lh $assets
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" $assets --clobber
+          else
+            gh release create "$RELEASE_TAG" $assets \
+              --title "Electerm ${ELECTERM_VERSION}" \
+              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy multi-arch, UOS 20 / Ubuntu compatible).
+
+            - Built on Ubuntu 18.04, glibc <= 2.28 baseline verified and installed on Debian 10 before publishing.
+            - See BUILD-INFO.txt inside each artifact for build environment details."
+          fi
+          gh release view "$RELEASE_TAG" \
+            --json tagName,assets --jq '.tagName, (.assets[].name)'
