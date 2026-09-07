@@ -1,28 +1,29 @@
 # =====================================================================
-# electerm 多架构 legacy 构建工作流 (UOS 20 / Ubuntu 兼容)
+# electerm ARM64 legacy 构建工作流 (UOS 20 / Ubuntu 兼容)
 # ---------------------------------------------------------------------
-# 参考 mysql 项目的 build-linux-uos20.yml 结构:
-#   1) build        原生 runner + 固定 glibc 基线的构建容器, 产物上传 artifact
+# 单文件只配置一个架构 (arm64)；如需 x64 请复制本文件, 将 runner 改为
+# ubuntu-latest、构建参数改为 x64 (见 README)。
+#
+# 结构 (参考 mysql 项目的 build-linux-uos20.yml):
+#   1) build        arm64 原生 runner 上, 宿主机跑 JS actions, 构建在
+#                   legacy 容器内 (docker run) 完成, 产物上传 artifact
 #   2) verify-uos20 在 Debian 10 (与 UOS 20 同为 glibc 2.28 基线) 上安装并
 #                   运行冒烟, 验证产物真能在老系统上跑
 #   3) release      推 v* tag 时把产物发布为 GitHub Release
 #
-# 为什么用 legacy 构建: electerm 的 node-pty / serialport 原生模块在新系统
-# 编译会链接新版 glibc 符号, UOS 20 (glibc 2.28) 装不上; legacy 构建在
-# Ubuntu 18.04 (glibc 2.27) 环境把 electron 降到 22.3.27、node-pty 0.10.1、
-# serialport 10.5.0、vite 4, 产物对 glibc 的要求不高于 2.28。
-# 构建容器: 官方维护的多架构镜像 zxdong262/electerm-builder-legacy
-#           (Ubuntu 18.04 + Node 16 + Python 3.8 + GCC 8 + ruby/fpm)
+# 为什么 legacy 构建 + docker run:
+#   electerm 的 node-pty / serialport 原生模块在新系统编译会链接新版 glibc
+#   符号, UOS 20 (glibc 2.28) 装不上; legacy 构建在 Ubuntu 18.04 (glibc 2.27)
+#   环境把 electron 降到 22.3.27、node-pty 0.10.1、serialport 10.5.0、vite 4。
+#   注意: legacy 容器 glibc 2.27 < node24 (JS actions 运行器) 要求的 2.28,
+#   所以不能把 job 的 container 设为该镜像, 必须宿主机 + docker run。
 #
-# 产物格式: 每种架构 4 种 —— tar.gz / deb / rpm / AppImage
-#   x64   : *-linux-amd64-legacy.deb, *-linux-x64-legacy.tar.gz,
-#           *-linux-x86_64-legacy.rpm, *-linux-x86_64-legacy.AppImage
+# 产物 (arm64 任务按官方脚本同时产出 armv7l, 可忽略):
 #   arm64 : *-linux-arm64-legacy.deb / .tar.gz / .AppImage,
 #           *-linux-aarch64-legacy.rpm
 #   armv7l: *-linux-armv7l-legacy.deb / .tar.gz / .rpm / .AppImage
-#   (arm64 与 armv7l 在 arm64 矩阵任务中依次构建)
 # =====================================================================
-name: Linux electerm (UOS 20 compatible)
+name: Linux electerm ARM64 (UOS 20 compatible)
 
 permissions:
   contents: read
@@ -61,27 +62,15 @@ env:
 
 jobs:
   build:
-    name: Build electerm ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: x64
-            runner: ubuntu-latest
-            machine: x86_64
-            build_script: x64
-          - platform: arm64
-            runner: ubuntu-22.04-arm
-            machine: aarch64
-            build_script: arm
-    runs-on: ${{ matrix.runner }}
-    # legacy 构建容器: Ubuntu 18.04 (glibc 2.27) + Node 16 + GCC 8 + fpm
-    container: zxdong262/electerm-builder-legacy:latest
+    name: Build electerm arm64
+    runs-on: ubuntu-22.04-arm
     timeout-minutes: 360
     env:
-      PACKAGE_PLATFORM: ${{ matrix.platform }}
+      PACKAGE_PLATFORM: arm64
 
     steps:
+      - uses: actions/checkout@v6
+
       - name: Resolve build inputs
         id: resolve
         env:
@@ -95,19 +84,6 @@ jobs:
           echo "ELECTERM_REF=$ref" >> "$GITHUB_ENV"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6
-
-      - name: Confirm UOS 20-compatible build baseline
-        run: |
-          set -eu
-          test "$(uname -m)" = "${{ matrix.machine }}"
-          # 构建容器 glibc 必须不高于 UOS 20 的 2.28 (此处为 2.27)
-          echo "build glibc: $(getconf GNU_LIBC_VERSION)"
-          node --version
-          python3 --version
-          gcc --version | head -n 1
-          fpm --version
-
       - name: Clone electerm source
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,17 +96,23 @@ jobs:
           echo "--- 已检出 ---"
           git -C build_src log -1 --oneline
 
-      - name: Build legacy packages (tar.gz/deb/rpm/AppImage)
+      # 构建在 legacy 容器内进行 (基线确认见 ci/build-legacy.sh 的 [0/6])
+      - name: Build legacy packages in container (tar.gz/deb/rpm/AppImage)
         env:
           USE_SYSTEM_FPM: "true"
           KEEP_FILE: "true"
         run: |
-          bash ci/build-legacy.sh ${{ matrix.build_script }}
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" -w /workspace \
+            -e ELECTERM_REF -e MAX_GLIBC -e MAX_GLIBCXX \
+            -e USE_SYSTEM_FPM -e KEEP_FILE -e PACKAGE_PLATFORM \
+            zxdong262/electerm-builder-legacy:latest \
+            bash /workspace/ci/build-legacy.sh arm
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: electerm-legacy-${{ matrix.platform }}
+          name: electerm-legacy-arm64-armv7l
           path: artifacts
           if-no-files-found: error
           compression-level: 0
@@ -154,21 +136,9 @@ jobs:
   # 产物在构建容器里只做了静态校验, 这里在真实的 UOS 20 ABI 基线
   # (Debian 10, glibc 2.28) 上安装并启动, 验证能真正跑起来。
   verify-uos20:
-    name: Verify Debian 10 (UOS 20 ABI) ${{ matrix.platform }}
+    name: Verify Debian 10 (UOS 20 ABI)
     needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: x64
-            runner: ubuntu-latest
-            machine: x86_64
-            deb_pattern: '*linux-amd64-legacy.deb'
-          - platform: arm64
-            runner: ubuntu-22.04-arm
-            machine: aarch64
-            deb_pattern: '*linux-arm64-legacy.deb'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-22.04-arm
     container: debian:10-slim
     timeout-minutes: 60
     env:
@@ -190,18 +160,18 @@ jobs:
 
       - uses: actions/download-artifact@v7
         with:
-          name: electerm-legacy-${{ matrix.platform }}
+          name: electerm-legacy-arm64-armv7l
           path: dist
 
       - name: Install the deb on the UOS 20 ABI baseline
         run: |
           set -eu
           head -n 2 /etc/os-release
-          test "$(uname -m)" = "${{ matrix.machine }}"
+          test "$(uname -m)" = "aarch64"
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
           cd dist
           sha256sum --check SHA256SUMS.txt
-          deb="$(find . -name '${{ matrix.deb_pattern }}' | head -n 1)"
+          deb="$(find . -name '*linux-arm64-legacy.deb' | head -n 1)"
           test -n "$deb"
           echo "installing: $deb"
           # apt 直接装本地 deb 并自动解析依赖 (libgtk-3, libnss3, libasound2 ...)
@@ -244,15 +214,9 @@ jobs:
 
     steps:
       - uses: actions/download-artifact@v7
-        continue-on-error: true
-        with:
-          name: electerm-legacy-x64
-          path: dist/x64
-      - uses: actions/download-artifact@v7
-        continue-on-error: true
         with:
           name: electerm-legacy-arm64-armv7l
-          path: dist/arm64
+          path: dist
 
       - name: Guard against mismatched version tags
         id: guard
@@ -260,7 +224,7 @@ jobs:
           set -eu
           tag="${GITHUB_REF#refs/tags/}"
           # 从产物 BUILD-INFO.txt 读取实际构建的 electerm 版本
-          version="$(grep -h '^electerm_version=' dist/*/BUILD-INFO.txt 2>/dev/null \
+          version="$(grep -h '^electerm_version=' dist/BUILD-INFO.txt 2>/dev/null \
             | head -n 1 | cut -d= -f2 || true)"
           test -n "$version"
           case "$tag" in
@@ -288,7 +252,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" $assets \
               --title "Electerm ${ELECTERM_VERSION}" \
-              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy multi-arch, UOS 20 / Ubuntu compatible).
+              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS 20 / Ubuntu compatible).
 
             - Built on Ubuntu 18.04, glibc <= 2.28 baseline verified and installed on Debian 10 before publishing.
             - See BUILD-INFO.txt inside each artifact for build environment details."

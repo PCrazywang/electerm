@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # =====================================================================
 # electerm legacy 构建脚本 (在 zxdong262/electerm-builder-legacy 容器内运行)
+# 宿主机挂载工作区后调用, 例如:
+#   docker run --rm --platform linux/arm64 \
+#     -v "${{ github.workspace }}:/workspace" -w /workspace \
+#     -e ELECTERM_REF -e MAX_GLIBC -e MAX_GLIBCXX \
+#     -e USE_SYSTEM_FPM -e KEEP_FILE -e PACKAGE_PLATFORM \
+#     zxdong262/electerm-builder-legacy:latest \
+#     bash /workspace/ci/build-legacy.sh arm
 # 用法: bash ci/build-legacy.sh x64 | arm
 #   x64 : 构建 x64 的 tar.gz/deb/rpm/AppImage (build-linux-legacy.js)
 #   arm : 构建 arm64 + armv7l 的 tar.gz/deb/rpm/AppImage (build-linux-arm-legacy.js)
@@ -22,6 +29,24 @@ ART_DIR="$WORKSPACE/artifacts"
 STATUS_FILE="$WORKSPACE/build_status"
 MAX_GLIBC="${MAX_GLIBC:-2.28}"
 MAX_GLIBCXX="${MAX_GLIBCXX:-3.4.25}"
+
+echo "================================================================"
+echo "[0/6] 确认 UOS 20 兼容构建基线"
+echo "================================================================"
+case "$ARCH_TARGET" in
+  arm) EXPECT_ARCH="aarch64" ;;
+  x64) EXPECT_ARCH="x86_64" ;;
+esac
+test "$(uname -m)" = "$EXPECT_ARCH" || {
+  echo "FAIL: uname -m=$(uname -m), expect $EXPECT_ARCH (arm64 构建必须在 arm64 主机/容器内进行)" >&2
+  exit 1
+}
+# 构建容器 glibc 必须不高于 UOS 20 的 2.28 (legacy 镜像为 Ubuntu 18.04, 即 2.27)
+echo "build glibc: $(getconf GNU_LIBC_VERSION)"
+node --version
+python3 --version
+gcc --version | head -n 1
+fpm --version
 
 cd "$SRC_DIR"
 ELECTERM_VERSION="$(node -p "require('./package.json').version")"
