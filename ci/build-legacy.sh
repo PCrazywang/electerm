@@ -12,7 +12,7 @@
 #
 # 用法: bash ci/build-legacy.sh x64 | arm
 #   x64 : 构建 x64 的 tar.gz/deb/rpm/AppImage (build-linux-legacy.js)
-#   arm : 构建 arm64 + armv7l 的 tar.gz/deb/rpm/AppImage (build-linux-arm-legacy.js)
+#   arm : 逐格式构建并门禁 arm64 的 tar.gz/deb/rpm/AppImage
 #
 # 环境变量 (由 workflow 提供):
 #   ELECTERM_SRC_REL 源码相对工作区的路径, 默认 source
@@ -67,6 +67,7 @@ write_build_info() {
     echo "max_glibc_ceiling=${MAX_GLIBC}"
     echo "max_glibcxx_ceiling=${MAX_GLIBCXX}"
     echo "build_rc=${BUILD_RC}"
+    echo "missing_artifacts=${missing_artifacts:-unknown}"
     echo "glibc_verify_ok=${VERIFY_OK}"
   } > "$ART_DIR/BUILD-INFO.txt"
 }
@@ -147,15 +148,27 @@ rm -rf "$ART_DIR"
 mkdir -p "$ART_DIR"
 write_build_info
 
-# 修改依赖前先备份源码里的 manifest。仓库内 vendored source/ 与 clone 两种布局
-# 都可能跑在自托管 runner 上; 无论成功失败都恢复, 避免污染后续构建。
+# 修改依赖和构建配置前先备份源码文件。仓库内 vendored source/ 与 clone 两种
+# 布局都可能跑在自托管 runner 上; 无论成功失败都恢复, 避免污染后续构建。
 MANIFEST_BACKUP="$WORKSPACE/.electerm-package.json.original"
 LOCK_BACKUP="$WORKSPACE/.electerm-package-lock.json.original"
+BUILDER_CONFIG_BACKUP="$WORKSPACE/.electerm-builder.json.original"
+INSTALL_SRC_BACKUP="$WORKSPACE/.electerm-install-src.js.original"
 cp package.json "$MANIFEST_BACKUP"
 if [ -f package-lock.json ]; then
   cp package-lock.json "$LOCK_BACKUP"
 else
   rm -f "$LOCK_BACKUP"
+fi
+if [ -f electron-builder.json ]; then
+  cp electron-builder.json "$BUILDER_CONFIG_BACKUP"
+else
+  rm -f "$BUILDER_CONFIG_BACKUP"
+fi
+if [ -f work/app/lib/install-src.js ]; then
+  cp work/app/lib/install-src.js "$INSTALL_SRC_BACKUP"
+else
+  rm -f "$INSTALL_SRC_BACKUP"
 fi
 
 restore_source_manifests() {
@@ -168,6 +181,18 @@ restore_source_manifests() {
     rm -f "$LOCK_BACKUP"
   else
     rm -f "$SRC_DIR/package-lock.json"
+  fi
+  if [ -f "$BUILDER_CONFIG_BACKUP" ]; then
+    cp "$BUILDER_CONFIG_BACKUP" "$SRC_DIR/electron-builder.json"
+    rm -f "$BUILDER_CONFIG_BACKUP"
+  else
+    rm -f "$SRC_DIR/electron-builder.json"
+  fi
+  if [ -f "$INSTALL_SRC_BACKUP" ]; then
+    cp "$INSTALL_SRC_BACKUP" "$SRC_DIR/work/app/lib/install-src.js"
+    rm -f "$INSTALL_SRC_BACKUP"
+  else
+    rm -f "$SRC_DIR/work/app/lib/install-src.js"
   fi
 }
 
@@ -230,28 +255,104 @@ npm run pb || fail "npm run pb 失败 (electron-builder 配置生成阶段)"
 echo "================================================================"
 echo "[5/7] 构建 legacy 安装包 (tar.gz / deb / rpm / AppImage)"
 echo "================================================================"
-# 这一步的失败是"部分失败": armv7l 交叉打包经常挂, 但 arm64 产物照样有用,
-# 所以不 fail, 只记录 rc, 后面照常汇总与校验。
-case "$ARCH_TARGET" in
-  arm) node build/bin/build-linux-arm-legacy ;;
-  x64) node build/bin/build-linux-legacy ;;
-esac
-BUILD_RC=$?
-echo "打包脚本退出码: RC=$BUILD_RC"
+if [ "$ARCH_TARGET" = "arm" ]; then
+  # 上游 build-linux-arm-legacy.js 把 arm64 与 armv7l 混在同一进程中。armv7l
+  # electron-rebuild 没有 catch, 一旦失败便以 RC=1 中止，导致已成功的 arm64 包
+  # 也被误判失败。本工作流只承诺 arm64，因此逐格式原生构建并独立记录结果。
+  BUILDER="$SRC_DIR/node_modules/.bin/electron-builder"
+  BUILDER_CONFIG="$SRC_DIR/electron-builder.json"
+  [ -x "$BUILDER" ] || fail "electron-builder 不存在: $BUILDER"
+  [ -f "$BUILDER_CONFIG" ] || fail "缺少 electron-builder 配置: $BUILDER_CONFIG"
+
+  build_arm64_package() {
+    local target="$1" install_src="$2"
+    echo "--- build arm64 ${target}: ${install_src} ---"
+    rm -rf "$SRC_DIR/dist"
+    if ! node - "$BUILDER_CONFIG" "$target" "$install_src" <<'NODE'
+const fs = require('fs')
+const path = require('path')
+const configPath = process.argv[2]
+const target = process.argv[3]
+const installSrc = process.argv[4]
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+config.linux.target = [target]
+if (config.artifactName) {
+  config.artifactName = config.artifactName.replace(
+    '${productName}-${version}-${os}-${arch}.${ext}',
+    '${productName}-${version}-${os}-${arch}-legacy.${ext}'
+  )
+}
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2))
+fs.writeFileSync(
+  path.resolve(path.dirname(configPath), 'work/app/lib/install-src.js'),
+  `module.exports = '${installSrc}'`
+)
+NODE
+    then
+      echo "FAIL: 无法为 arm64 ${target} 更新 electron-builder 配置" >&2
+      return 1
+    fi
+    if "$BUILDER" --linux --arm64; then
+      find "$SRC_DIR/dist" -maxdepth 1 -type f \
+        \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.tar.gz' \) \
+        -exec cp -v {} "$ART_DIR/" \;
+      return 0
+    fi
+    echo "FAIL: arm64 ${target} 打包失败; 继续尝试其他格式以保留诊断产物" >&2
+    return 1
+  }
+
+  BUILD_RC=0
+  build_arm64_package tar.gz "linux-arm64-legacy.tar.gz" || BUILD_RC=1
+  build_arm64_package deb "linux-arm64-legacy.deb" || BUILD_RC=1
+  build_arm64_package rpm "linux-aarch64-legacy.rpm" || BUILD_RC=1
+  build_arm64_package AppImage "linux-arm64-legacy.AppImage" || BUILD_RC=1
+else
+  node build/bin/build-linux-legacy
+  BUILD_RC=$?
+fi
+echo "打包步骤汇总退出码: RC=$BUILD_RC"
 
 echo "================================================================"
-echo "[6/7] 汇总产物到 artifacts/"
+echo "[6/7] 汇总并校验必需产物"
 echo "================================================================"
-for d in dist*/; do
-  [ -d "$d" ] || continue
-  find "$d" -maxdepth 1 -type f \
-    \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.tar.gz' \) \
-    -exec cp -v {} "$ART_DIR/" \;
+# x64 上游脚本仍使用 KEEP_FILE 保存到 dist*; arm64 已在每种格式完成时复制。
+if [ "$ARCH_TARGET" = "x64" ]; then
+  for d in dist*/; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -type f \
+      \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.tar.gz' \) \
+      -exec cp -v {} "$ART_DIR/" \;
+  done
+fi
+
+case "$ARCH_TARGET" in
+  arm)
+    required_artifacts="
+      electerm-${ELECTERM_VERSION}-linux-arm64-legacy.tar.gz
+      electerm-${ELECTERM_VERSION}-linux-arm64-legacy.deb
+      electerm-${ELECTERM_VERSION}-linux-aarch64-legacy.rpm
+      electerm-${ELECTERM_VERSION}-linux-arm64-legacy.AppImage"
+    ;;
+  x64)
+    required_artifacts="
+      electerm-${ELECTERM_VERSION}-linux-x64-legacy.tar.gz
+      electerm-${ELECTERM_VERSION}-linux-amd64-legacy.deb
+      electerm-${ELECTERM_VERSION}-linux-x86_64-legacy.rpm
+      electerm-${ELECTERM_VERSION}-linux-x86_64-legacy.AppImage"
+    ;;
+esac
+missing_artifacts=0
+for name in $required_artifacts; do
+  if [ ! -s "$ART_DIR/$name" ]; then
+    echo "FAIL: 缺少必需产物或文件为空: $name" >&2
+    missing_artifacts=1
+  fi
 done
 produced="$(find "$ART_DIR" -maxdepth 1 -type f \
   \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.tar.gz' \) | wc -l)"
-echo "已汇总 $produced 个安装包"
-[ "$produced" -gt 0 ] || fail "没有产出任何安装包 (打包脚本 RC=$BUILD_RC), 见上方 electron-builder 日志"
+echo "已汇总 $produced 个安装包; missing_artifacts=$missing_artifacts"
+[ "$missing_artifacts" -eq 0 ] || BUILD_RC=1
 
 echo "================================================================"
 echo "[7/7] glibc / libstdc++ 兼容性静态校验"
@@ -299,27 +400,31 @@ verify_tarball() {
 VERIFY_OK=1
 scanned=0
 cd "$ART_DIR"
-for tarball in *-legacy.tar.gz; do
+case "$ARCH_TARGET" in
+  arm) verify_pattern='*-linux-arm64-legacy.tar.gz' ;;
+  x64) verify_pattern='*-linux-x64-legacy.tar.gz' ;;
+esac
+for tarball in $verify_pattern; do
   [ -f "$tarball" ] || continue
   scanned=$((scanned + 1))
   verify_tarball "$tarball" "${tarball%.tar.gz}" || VERIFY_OK=0
 done
 rm -rf "$WORKSPACE/.verify"
 
-if [ "$scanned" -eq 0 ]; then
-  # 没有 tar.gz 就没法做符号扫描, 这时不能声称"通过校验"
-  echo "[verify] 没有找到 *-legacy.tar.gz, 无法做 glibc 静态校验" >&2
+if [ "$scanned" -ne 1 ]; then
+  # 必需架构必须恰好有一个 tar.gz，不能用其他架构的包代替 ABI 校验。
+  echo "[verify] 期望 1 个 $verify_pattern, 实际找到 $scanned 个" >&2
   VERIFY_OK=0
 else
-  echo "[verify] 已扫描 $scanned 个 tar.gz, verify_ok=$VERIFY_OK"
+  echo "[verify] 已扫描必需架构 tar.gz, verify_ok=$VERIFY_OK"
 fi
 
-if [ "$BUILD_RC" -eq 0 ] && [ "$VERIFY_OK" -eq 1 ]; then
+if [ "$BUILD_RC" -eq 0 ] && [ "$missing_artifacts" -eq 0 ] && [ "$VERIFY_OK" -eq 1 ]; then
   echo "0" > "$STATUS_FILE"
-  echo "构建成功: 全部目标已生成并通过 glibc 兼容性校验"
+  echo "构建成功: 必需架构的 4 个目标均已生成并通过 glibc 兼容性校验"
 else
   echo "1" > "$STATUS_FILE"
-  echo "警告: 构建或 glibc 校验存在失败 (RC=$BUILD_RC verify_ok=$VERIFY_OK), 已产出的包仍保留在 artifacts/" >&2
+  echo "警告: 打包、产物门禁或 glibc 校验失败 (RC=$BUILD_RC missing=$missing_artifacts verify_ok=$VERIFY_OK), 已产出的包仍保留在 artifacts/" >&2
 fi
 
 # trap on_exit 会补齐 BUILD-INFO.txt / SHA256SUMS.txt 并打印清单

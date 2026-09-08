@@ -4,8 +4,9 @@
 **electerm 2.10.26**（及其同系列版本）的 **arm64** Linux 安装包，产物经 **Debian 10
 （UOS 20 ABI 基线）真机验证**，可直接安装用于 **SSH / SFTP / Telnet / 串口** 连接。
 
-> 按「单个 yml 只配置一个架构」的原则，本文件只做 **arm64**（含官方脚本顺带产出的
-> armv7l，可忽略）。需要 x64 时复制本文件另存一份，改三处即可，见下文。
+> 按「单个 yml 只配置一个架构」的原则，本文件只做 **arm64**。上游 ARM 脚本会
+> 把 arm64 与 armv7l 绑在一次运行中，armv7l 交叉重编译失败会连带中断；本 CI
+> 因而按格式直接构建并门禁 4 个 arm64 产物。需要 x64 时复制本文件另存一份，见下文。
 
 ## 为什么需要 "legacy" 构建
 
@@ -31,14 +32,14 @@ GitHub Actions 的 **JS actions（checkout / upload-artifact 等）在 job 容�
 
 因此 build 任务**不设 job 容器**：checkout、上传产物等 JS actions 跑在宿主机
 （node24 正常），真正编译打包在容器里通过 `docker run` 完成；基线确认也移进了
-`ci/build-legacy.sh` 的 `[0/6]`。verify 任务用的 `debian:10-slim` 正好是
+`ci/build-legacy.sh` 的 `[0/7]`。verify 任务用的 `debian:10-slim` 正好是
 glibc 2.28，所以可以直接用 `container:`。
 
 ## 工作流结构（对应 mysql 的 build-linux-uos20.yml）
 
 | 任务 | 做什么 | 对应 mysql |
 |---|---|---|
-| `build` | arm64 原生 runner（ubuntu-22.04-arm），宿主机跑 JS actions + `docker run` legacy 容器构建，产出 tar.gz/deb/rpm/AppImage；即使失败也上传 `BUILD-INFO.txt` 诊断 artifact | `build` |
+| `build` | arm64 原生 runner（ubuntu-22.04-arm），宿主机跑 JS actions + `docker run` legacy 容器逐格式构建 arm64，明确门禁 tar.gz/deb/rpm/AppImage；即使失败也上传 `BUILD-INFO.txt` 诊断 artifact | `build` |
 | `verify-uos20` | 在 **Debian 10**（glibc 2.28，与 UOS 20 同基线）容器中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟 | `verify-uos20` |
 | `release` | 推 `v*` tag 时，把通过验证的产物发布为 GitHub Release（tag 与版本不符则拒绝） | `release` |
 
@@ -79,10 +80,13 @@ glibc 2.28，所以可以直接用 `container:`。
 
 ### 产物
 
-| 架构 | runner | 构建方式 | 产物（每种架构 4 个） |
+| 架构 | runner | 构建方式 | 必需产物（4 个） |
 |---|---|---|---|
-| arm64 | ubuntu-22.04-arm | docker run legacy 镜像 (arm64) | `electerm-2.10.26-linux-arm64-legacy.deb` `.tar.gz` `.AppImage`、`-linux-aarch64-legacy.rpm` |
-| armv7l（随 arm64 任务） | 同上 | 同上 | `-linux-armv7l-legacy.deb` `.tar.gz` `.rpm` `.AppImage` |
+| arm64 | ubuntu-22.04-arm | docker run legacy 镜像 (arm64)，逐格式打包 | `electerm-2.10.26-linux-arm64-legacy.deb`、`.tar.gz`、`.AppImage`，以及 `-linux-aarch64-legacy.rpm` |
+
+> armv7l 不属于本工作流目标。这样可避免上游组合脚本在 arm64 已成功后因
+> `electron-rebuild --arch armv7l` 失败而整体返回非零；CI 仍会严格要求上述 4 个
+> arm64 文件均存在且非空，并对 arm64 tar.gz 做 ABI 校验。
 
 > 官方 v2.10.26 release 中即有同名 legacy 产物，可对照
 > <https://github.com/electerm/electerm/releases/tag/v2.10.26> 验证命名。
@@ -177,7 +181,7 @@ git push origin v2.10.26
 | `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Debian 10 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
 | `verify-uos20` 装 deb 时 apt 报依赖缺失 | buster 仓库缺个别依赖（少见）；可改从 tar.gz 解压运行 |
 | 冒烟测试无版本号输出 | 看日志中 electerm 的报错；多为缺运行库，`apt install` 对应库后重跑 |
-| 构建任务在「检查构建状态」标红 | 下载该次 artifact 查看 `BUILD-INFO.txt`，并在日志搜索 `FAIL:`、`RC=`、`verify_ok=`；脚本会保留诊断信息与已生成的包 |
+| 构建任务在「检查构建状态」标红 | `container_build=success` 仅表示诊断脚本正常收尾；查看同一步的 `build_rc`、`missing_artifacts`、`glibc_verify_ok`，再到容器日志搜索 `FAIL:`。当前流程逐格式构建 arm64，某一格式失败不会阻止其他格式上传，但缺任何一个必需文件仍会标红 |
 | Release 被拒绝发布 | tag 与 `BUILD-INFO.txt` 的 `electerm_version` 不一致；确认 tag 写成 `v<版本号>` |
 | 产物过期 | artifact 保留 14 天；要长期保存请用 tag 发布 Release |
 | 报 `build-linux-legacy.js` 不存在 | 所选 ref 太旧，官方还没引入 legacy 构建脚本；选 v2.10.26 或更新版本 |

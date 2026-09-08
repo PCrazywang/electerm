@@ -20,10 +20,10 @@
 #   - 构建中途失败也要留下日志和已产出的包: 容器步骤 continue-on-error, 产物
 #     无条件上传, 任务红绿只由最后的「构建状态门禁」一步决定。
 #
-# 产物 (arm64 任务按官方脚本顺带产出 armv7l, 可忽略):
-#   arm64 : *-linux-arm64-legacy.deb / .tar.gz / .AppImage,
-#           *-linux-aarch64-legacy.rpm
-#   armv7l: *-linux-armv7l-legacy.deb / .tar.gz / .rpm / .AppImage
+# 产物 (本工作流只构建并门禁 arm64，避免上游组合脚本中的 armv7l
+# 交叉重编译失败连带误伤 arm64):
+#   *-linux-arm64-legacy.deb / .tar.gz / .AppImage
+#   *-linux-aarch64-legacy.rpm
 # =====================================================================
 name: Linux electerm ARM64 (UOS 20 compatible)
 
@@ -137,7 +137,8 @@ jobs:
             echo "源码不完整: 缺少 $src/package.json" >&2
             exit 1
           fi
-          # legacy 打包脚本是官方 2.10.x 才有的; ref 太旧时在这里就说清楚
+          # 本 CI 直接调用 electron-builder 逐格式打包，但仍要求该 ref 提供官方
+          # legacy ARM 构建入口，作为受支持的 2.10.x 源码布局门禁。
           if [ ! -f "$src/build/bin/build-linux-arm-legacy.js" ]; then
             echo "源码里没有 build/bin/build-linux-arm-legacy.js, 该 ref 还没有 legacy 构建脚本; 请用 v2.10.26 或更新版本。" >&2
             ls -la "$src/build/bin" 2>/dev/null || true
@@ -277,7 +278,7 @@ jobs:
           head -n 2 /etc/os-release
           test "$(uname -m)" = "aarch64"
           test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
-          cd dist
+          cd artifacts
           ls -lh
           sha256sum --check SHA256SUMS.txt
           deb="$(find . -name '*linux-arm64-legacy.deb' | head -n 1)"
@@ -292,7 +293,7 @@ jobs:
       - name: Install the deb on the UOS 20 ABI baseline
         run: |
           set -eu
-          cd dist
+          cd artifacts
           deb="$(find . -name '*linux-arm64-legacy.deb' | head -n 1)"
           test -n "$deb"
           echo "installing: $deb"
@@ -380,7 +381,7 @@ jobs:
             *) echo "Tag '${tag}' 与实际构建的 electerm 版本 '${ELECTERM_VERSION}' 不一致, 拒绝发布。" >&2; exit 1 ;;
           esac
           # 再和产物内的 BUILD-INFO.txt 对一次, 确认下载到的就是这次构建的包
-          built="$(sed -n 's/^electerm_version=//p' dist/BUILD-INFO.txt | head -n 1)"
+          built="$(sed -n 's/^electerm_version=//p' artifacts/BUILD-INFO.txt | head -n 1)"
           if [ "$built" != "$ELECTERM_VERSION" ]; then
             echo "BUILD-INFO.txt 记录的版本 '${built}' 与构建输出 '${ELECTERM_VERSION}' 不一致。" >&2
             exit 1
@@ -396,7 +397,7 @@ jobs:
           ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
         run: |
           set -eu
-          assets="$(find dist -type f \( -name '*.deb' -o -name '*.rpm' \
+          assets="$(find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \
             -o -name '*.AppImage' -o -name '*.tar.gz' -o -name 'SHA256SUMS.txt' \
             -o -name 'BUILD-INFO.txt' \) | sort)"
           test -n "$assets"
