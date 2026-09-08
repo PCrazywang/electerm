@@ -1,8 +1,9 @@
 # electerm ARM64 GitHub Actions 构建（UOS 20 / Ubuntu 兼容）
 
 参考 mysql 项目已验证的 `build-linux-uos20.yml` 结构，用 GitHub Actions 构建
-**electerm 2.10.26**（及其同系列版本）的 **arm64** Linux 安装包，产物经 **Debian 10
-（UOS 20 ABI 基线）真机验证**，可直接安装用于 **SSH / SFTP / Telnet / 串口** 连接。
+**electerm 2.10.26**（及其同系列版本）的 **arm64** Linux 安装包。构建产物会在
+**Ubuntu 20.04 用户态**中安装、检查依赖并启动冒烟；这不是 UOS 内核验证，旧系统
+兼容性由构建期的 ELF 符号上限检查保证。可直接安装用于 **SSH / SFTP / Telnet / 串口** 连接。
 
 > 按「单个 yml 只配置一个架构」的原则，本文件只做 **arm64**。上游 ARM 脚本会
 > 把 arm64 与 armv7l 绑在一次运行中，armv7l 交叉重编译失败会连带中断；本 CI
@@ -32,15 +33,14 @@ GitHub Actions 的 **JS actions（checkout / upload-artifact 等）在 job 容�
 
 因此 build 任务**不设 job 容器**：checkout、上传产物等 JS actions 跑在宿主机
 （node24 正常），真正编译打包在容器里通过 `docker run` 完成；基线确认也移进了
-`ci/build-legacy.sh` 的 `[0/7]`。verify 任务用的 `debian:10-slim` 正好是
-glibc 2.28，所以可以直接用 `container:`。
+`ci/build-legacy.sh` 的 `[0/7]`。verify 任务使用 `ubuntu:20.04` 用户态，因此也可以直接用 `container:`；但 Docker 容器共享 GitHub runner 的内核，不能将其视为 UOS 内核测试。
 
 ## 工作流结构（对应 mysql 的 build-linux-uos20.yml）
 
 | 任务 | 做什么 | 对应 mysql |
 |---|---|---|
 | `build` | arm64 原生 runner（ubuntu-22.04-arm），宿主机跑 JS actions + `docker run` legacy 容器逐格式构建 arm64，明确门禁 tar.gz/deb/rpm/AppImage；即使失败也上传 `BUILD-INFO.txt` 诊断 artifact | `build` |
-| `verify-uos20` | 在 **Debian 10**（glibc 2.28，与 UOS 20 同基线）容器中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟 | `verify-uos20` |
+| `verify-uos20` | 在 **Ubuntu 20.04 用户态**中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟；Docker 共享 runner 内核，不替代真实 UOS 测试 | `verify-uos20` |
 | `release` | 推 `v*` tag 时，把通过验证的产物发布为 GitHub Release（tag 与版本不符则拒绝） | `release` |
 
 **额外的 glibc 静态校验**（构建任务内）：解包每个 tar.gz，用 `readelf` 扫描全部 ELF
@@ -68,7 +68,7 @@ glibc 2.28，所以可以直接用 `container:`。
 
 - **push** 到 `master` / `main`：自动构建
 - **pull_request** 到 `master` / `main`：自动构建
-- **tag** 推 `v*`（如 `v2.10.26`）：构建 → Debian 10 验证 → 发布 GitHub Release
+- **tag** 推 `v*`（如 `v2.10.26`）：构建 → Ubuntu 20.04 用户态验证 → 发布 GitHub Release
 - **手动**：Actions → `Linux electerm ARM64 (UOS 20 compatible)` → Run workflow
 
 手动触发参数：
@@ -113,7 +113,7 @@ jobs:
 
 ## 安装与使用
 
-### UOS 20（Debian 系，arm64）
+### UOS 20（arm64）
 
 ```bash
 sudo dpkg -i electerm-2.10.26-linux-arm64-legacy.deb
@@ -179,7 +179,7 @@ git push origin v2.10.26
 | `electron` 安装报 `EACCES ... /root/.cache/electron/...zip` | legacy 镜像的预置 Electron 缓存存在错误权限。Electron 22 实际读取的是小写 `electron_config_cache`（不是常见的 `ELECTRON_CACHE`）；脚本已同时设置它和 npm 等价变量到可写的 `/tmp/electerm-electron-cache-*`。重新运行即可；若仍访问 `/root`，确认实际运行的是更新后的 `ci/build-legacy.sh` |
 | `actions/checkout@v6` 报 `GLIBC_2.28 not found` | build 任务误用了 glibc < 2.28 的 `container:`；必须保持宿主机 + `docker run`（本工作流已如此） |
 | `sha256sum --check` 校验 `SHA256SUMS.txt` 自身失败 | 使用旧脚本生成了自包含清单；当前脚本显式排除 `SHA256SUMS.txt`，重新构建即可 |
-| `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Debian 10 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
+| `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Ubuntu 20.04 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
 | `verify-uos20` 装 deb 时 apt 报依赖缺失 | buster 仓库缺个别依赖（少见）；可改从 tar.gz 解压运行 |
 | 冒烟测试无版本号输出 | 看日志中 electerm 的报错；多为缺运行库，`apt install` 对应库后重跑 |
 | 构建任务在「检查构建状态」标红 | `container_build=success` 仅表示诊断脚本正常收尾。查看 `BUILD-INFO.txt` 的 `build_phase`、`failure_reason`、`build_rc`、`missing_artifacts`、`glibc_verify_ok`；同一 artifact 的 `BUILD-LOG.txt` 含完整容器日志，状态门禁也会打印其最后 200 行。当前流程逐格式构建 arm64，某一格式失败不会阻止其他格式上传，但缺任何一个必需文件仍会标红 |
@@ -190,7 +190,6 @@ git push origin v2.10.26
 ## 验证方式
 
 - 构建任务内：`readelf` 静态校验全部 ELF 的 glibc/libstdc++ 符号上限（≤ 2.28 / 3.4.25）；
-- 验证任务内：在 **Debian 10**（与 UOS 20 同为 glibc 2.28）上 `apt` 安装 deb、
-  `sha256sum` 校验、逐文件 `ldd` 检查依赖、启动冒烟；
+- 验证任务内：在 **Ubuntu 20.04 用户态**上 `apt` 安装 deb、`sha256sum` 校验、逐文件 `ldd` 检查依赖、启动冒烟；容器共享 runner 内核，因此真实 UOS 环境仍应补充实际安装验证；
 - 每次构建生成排除自身的 `SHA256SUMS.txt`，可在产物目录执行 `sha256sum -c SHA256SUMS.txt` 校验；
 - 建议在真机 UOS 20 / Ubuntu 上安装后做一次 SSH 连接冒烟测试。

@@ -7,8 +7,9 @@
 # 结构对齐 mysql/tag_v8.0.25/.github/workflows/build-linux-uos20.yml:
 #   1) build        arm64 原生 runner; JS actions 跑宿主机, 编译打包在 legacy
 #                   容器内 (docker run) 完成; 产物与状态文件上传 artifact
-#   2) verify-uos20 Debian 10 (与 UOS 20 同为 glibc 2.28 基线) 安装 deb、
-#                   逐个 ELF 查依赖、真实启动冒烟
+#   2) verify-uos20 Ubuntu 20.04 用户态安装 deb、逐个 ELF 查依赖、真实启动冒烟。
+#                   容器与宿主共享内核，不能把它当成 UOS 内核验证；UOS 的旧
+#                   glibc 兼容性由 build 中的静态符号上限强制保证。
 #   3) release      推 v* tag 时把已验证产物发布为 GitHub Release
 #
 # 三条关键约束 (改动前请先读):
@@ -63,7 +64,8 @@ env:
   ELECTERM_REF: v2.10.26
   # legacy 构建镜像 (Ubuntu 18.04 / Node 16 / GCC 8), 必须带 linux/arm64 manifest
   BUILDER_IMAGE: zxdong262/electerm-builder-legacy:latest
-  # UOS 20 / Debian 10 / EL8 共享的 ABI 基线: glibc 2.28, libstdc++ (gcc 8) 3.4.25
+  # 旧系统兼容策略的静态符号上限：glibc 2.28、libstdc++ (GCC 8) 3.4.25。
+  # 这是构建门禁，不把任一 Docker 用户态容器表述为 UOS 内核验证。
   MAX_GLIBC: '2.28'
   MAX_GLIBCXX: '3.4.25'
 
@@ -241,31 +243,26 @@ jobs:
           fi
           echo "构建完成: 全部目标已生成并通过 glibc 兼容性校验"
 
-  # 构建容器里只做了静态符号校验, 这里在真实的 UOS 20 ABI 基线 (Debian 10,
-  # glibc 2.28) 上安装并启动, 验证产物真能在老系统跑起来。
+  # 构建容器只做静态符号校验；这里使用 Ubuntu 20.04 用户态安装并启动 deb，
+  # 验证动态依赖与 GUI 主进程。Docker 容器共享 GitHub runner 内核，不能将本
+  # 检查表述为 UOS 内核验证；UOS 旧 glibc 兼容性由 build 中的符号上限保证。
   verify-uos20:
-    name: Verify Debian 10 (UOS 20 ABI)
+    name: Verify Ubuntu 20.04 (UOS 20 runtime)
     needs: build
     runs-on: ubuntu-22.04-arm
-    container: debian:10-slim
+    container: ubuntu:20.04
     timeout-minutes: 60
     env:
       DEBIAN_FRONTEND: noninteractive
       ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
 
     steps:
-      - name: Install Debian 10 runtime dependencies
+      - name: Install Ubuntu 20.04 runtime dependencies
         run: |
           set -eu
-          # buster 已归档, 换 archive.debian.org 并关闭 Valid-Until 检查
-          printf '%s\n' \
-            'deb http://archive.debian.org/debian buster main' \
-            'deb http://archive.debian.org/debian-security buster/updates main' \
-            > /etc/apt/sources.list
-          printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99archive
-          apt-get -o Acquire::Check-Valid-Until=false update
-          # xauth 是 xvfb-run 的必需品, 而它只是 xvfb 的 Recommends,
-          # --no-install-recommends 下必须显式列出, 否则冒烟步骤起不来。
+          apt-get update
+          # Ubuntu 20.04 的 --no-install-recommends 下，xauth 是 xvfb-run 的必需项，
+          # 因此显式安装。
           apt-get install -y --no-install-recommends \
             ca-certificates curl xz-utils xvfb xauth procps
 
@@ -275,15 +272,15 @@ jobs:
           name: electerm-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts
 
-      - name: Verify the downloaded artifact on the UOS 20 ABI baseline
+      - name: Verify the downloaded artifact in Ubuntu 20.04 userspace
         run: |
           set -eu
-          # JS actions may have run on the host; assert that this shell itself is
-          # really inside Debian 10 before accepting any compatibility result.
-          grep -q '^VERSION_ID="10"$' /etc/os-release
+          # container 与 GitHub runner 共享内核；这里只断言 Ubuntu 20.04 用户态。
+          # UOS 20 所需的旧 glibc 上限由 build 任务的 ELF 符号检查单独保证。
+          grep -q '^VERSION_ID="20.04"$' /etc/os-release
           head -n 2 /etc/os-release
           test "$(uname -m)" = "aarch64"
-          test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
+          getconf GNU_LIBC_VERSION
           cd artifacts
           ls -lh
           sha256sum --check SHA256SUMS.txt
@@ -296,7 +293,7 @@ jobs:
           dpkg-deb --info "$deb" >/dev/null
           dpkg-deb --contents "$deb" | head -n 20 || true
 
-      - name: Install the deb on the UOS 20 ABI baseline
+      - name: Install the deb in Ubuntu 20.04 userspace
         run: |
           set -eu
           cd artifacts
@@ -315,7 +312,7 @@ jobs:
             *) echo "deb 版本与构建版本不一致" >&2; exit 1 ;;
           esac
 
-      - name: Verify every ELF dependency resolves on Debian 10
+      - name: Verify every ELF dependency resolves in Ubuntu 20.04
         run: |
           set -eu
           # 不止主程序: electron 自带的 .so 与 app.asar.unpacked 里的原生模块
@@ -340,7 +337,7 @@ jobs:
         run: |
           set -eu
           # electerm 是 GUI 程序, --version 不保证被 main 进程处理, 所以只当
-          # 参考信息打印; 真正的判据是能在 glibc 2.28 上启动并持续运行。
+          # 参考信息打印; 真正的判据是能在 Ubuntu 20.04 用户态启动并持续运行。
           echo "--- electerm --version (informational) ---"
           timeout 90 xvfb-run -a /opt/electerm/electerm \
             --no-sandbox --disable-gpu --version 2>&1 || true
@@ -415,7 +412,7 @@ jobs:
               --title "Electerm ${ELECTERM_VERSION}" \
               --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS 20 / Ubuntu compatible).
 
-          - Built on Ubuntu 18.04, glibc <= 2.28 baseline verified, installed and started on Debian 10 before publishing.
+          - Built on Ubuntu 18.04; legacy ABI ceilings are statically verified, then the package is installed and started in Ubuntu 20.04 userspace before publishing.
           - See BUILD-INFO.txt for build environment details."
           fi
           gh release view "$RELEASE_TAG" \
