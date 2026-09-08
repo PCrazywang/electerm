@@ -176,6 +176,7 @@ git push origin v2.10.26
 | 日志显示仓库没有 `source/` | 正常：工作流会自动从 `source_repo@electerm_ref` 克隆；若克隆也失败，检查 ref、仓库名与网络 |
 | `no matching manifest for linux/arm64` | legacy 镜像没有 ARM64 manifest；镜像预检会提前失败并显示可用平台，需改用带 ARM64 的镜像或改走 x64 工作流 |
 | 报 `No matching version found for @electerm/electerm-resource@1.3.7` | 该版本在 npm 不存在，`ci/build-legacy.sh` 会自动修正为 1.3.6；如源码引用其他失效版本，在脚本的依赖调整处固定到实际存在的版本 |
+| `electron` 安装报 `EACCES ... /root/.cache/electron/...zip` | legacy 镜像的预置 Electron 缓存存在错误权限；脚本会为本次容器运行切换到可写的 `/tmp/electerm-electron-cache-*`，重新运行即可。若自定义镜像仍复现，检查其是否覆盖了 `ELECTRON_CACHE` |
 | `actions/checkout@v6` 报 `GLIBC_2.28 not found` | build 任务误用了 glibc < 2.28 的 `container:`；必须保持宿主机 + `docker run`（本工作流已如此） |
 | `sha256sum --check` 校验 `SHA256SUMS.txt` 自身失败 | 使用旧脚本生成了自包含清单；当前脚本显式排除 `SHA256SUMS.txt`，重新构建即可 |
 | `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Debian 10 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |

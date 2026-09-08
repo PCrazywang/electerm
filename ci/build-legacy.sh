@@ -39,6 +39,11 @@ ART_DIR="$WORKSPACE/artifacts"
 STATUS_FILE="$WORKSPACE/build_status"
 MAX_GLIBC="${MAX_GLIBC:-2.28}"
 MAX_GLIBCXX="${MAX_GLIBCXX:-3.4.25}"
+# legacy 镜像可能预置了由其他用户写入的 /root/.cache/electron；Electron 的
+# postinstall 对该缓存 stat 会直接 EACCES。每个容器构建使用自己的临时缓存，
+# 三次 npm 重试仍复用下载结果，容器退出后自动清理。
+ELECTRON_CACHE="${ELECTRON_CACHE:-/tmp/electerm-electron-cache-$$}"
+export ELECTRON_CACHE
 ELECTERM_VERSION="unknown"
 BUILD_RC=1
 VERIFY_OK=0
@@ -68,6 +73,7 @@ write_build_info() {
     echo "glibc=${glibc_info}"
     echo "gcc=${gcc_info}"
     echo "node=${node_info}"
+    echo "electron_cache=${ELECTRON_CACHE}"
     echo "build_container=zxdong262/electerm-builder-legacy (Ubuntu 18.04 / Node 16 / GCC 8)"
     echo "max_glibc_ceiling=${MAX_GLIBC}"
     echo "max_glibcxx_ceiling=${MAX_GLIBCXX}"
@@ -233,6 +239,12 @@ echo "================================================================"
 echo "[2/7] 安装 npm 依赖 (registry 抖动时自动重试)"
 echo "================================================================"
 BUILD_PHASE="npm-config"
+# 不使用镜像预置的 /root/.cache/electron：其中若有不同 UID/权限留下的 zip，
+# electron@22 的 install.js 会在 stat 阶段 EACCES，npm 重试没有任何作用。
+rm -rf "$ELECTRON_CACHE"
+mkdir -p "$ELECTRON_CACHE"
+test -w "$ELECTRON_CACHE" || fail "Electron 缓存目录不可写: $ELECTRON_CACHE"
+echo "Electron cache: $ELECTRON_CACHE"
 npm config set legacy-peer-deps true
 npm config set cache /tmp/.npm
 # 旧 Node 16 + 老 registry 组合下网络抖动很常见, 让 npm 自己多试几次,
@@ -245,7 +257,7 @@ BUILD_PHASE="npm-install"
 npm_install_ok=0
 for attempt in 1 2 3; do
   echo "--- npm i (第 $attempt 次) ---"
-  if npm i; then
+  if npm i --cache /tmp/.npm; then
     npm_install_ok=1
     break
   fi
