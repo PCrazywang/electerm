@@ -225,12 +225,18 @@ jobs:
           fi
           status="$(cat build_status)"
           echo "build_status=$status"
+          # 别只看这一步: container 脚本始终正常退出以保证 artifact 上传。真实
+          # 根因见 BUILD-INFO 的 build_phase/failure_reason，以及 BUILD-LOG.txt。
           if [ -f artifacts/BUILD-INFO.txt ]; then
             echo "--- BUILD-INFO.txt ---"
             cat artifacts/BUILD-INFO.txt
           fi
+          if [ -f artifacts/BUILD-LOG.txt ]; then
+            echo "--- BUILD-LOG.txt (last 200 lines) ---"
+            tail -n 200 artifacts/BUILD-LOG.txt || true
+          fi
           if [ "$status" != "0" ]; then
-            echo "构建或 glibc 校验存在失败, 详见上方日志; 已产出的包仍可从 artifact 下载。" >&2
+            echo "构建或 glibc 校验存在失败；下载 artifact 查看 BUILD-INFO.txt 和 BUILD-LOG.txt。" >&2
             exit 1
           fi
           echo "构建完成: 全部目标已生成并通过 glibc 兼容性校验"

@@ -181,7 +181,7 @@ git push origin v2.10.26
 | `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Debian 10 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
 | `verify-uos20` 装 deb 时 apt 报依赖缺失 | buster 仓库缺个别依赖（少见）；可改从 tar.gz 解压运行 |
 | 冒烟测试无版本号输出 | 看日志中 electerm 的报错；多为缺运行库，`apt install` 对应库后重跑 |
-| 构建任务在「检查构建状态」标红 | `container_build=success` 仅表示诊断脚本正常收尾；查看同一步的 `build_rc`、`missing_artifacts`、`glibc_verify_ok`，再到容器日志搜索 `FAIL:`。当前流程逐格式构建 arm64，某一格式失败不会阻止其他格式上传，但缺任何一个必需文件仍会标红 |
+| 构建任务在「检查构建状态」标红 | `container_build=success` 仅表示诊断脚本正常收尾。查看 `BUILD-INFO.txt` 的 `build_phase`、`failure_reason`、`build_rc`、`missing_artifacts`、`glibc_verify_ok`；同一 artifact 的 `BUILD-LOG.txt` 含完整容器日志，状态门禁也会打印其最后 200 行。当前流程逐格式构建 arm64，某一格式失败不会阻止其他格式上传，但缺任何一个必需文件仍会标红 |
 | Release 被拒绝发布 | tag 与 `BUILD-INFO.txt` 的 `electerm_version` 不一致；确认 tag 写成 `v<版本号>` |
 | 产物过期 | artifact 保留 14 天；要长期保存请用 tag 发布 Release |
 | 报 `build-linux-legacy.js` 不存在 | 所选 ref 太旧，官方还没引入 legacy 构建脚本；选 v2.10.26 或更新版本 |

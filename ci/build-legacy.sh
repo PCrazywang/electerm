@@ -42,6 +42,11 @@ MAX_GLIBCXX="${MAX_GLIBCXX:-3.4.25}"
 ELECTERM_VERSION="unknown"
 BUILD_RC=1
 VERIFY_OK=0
+# 任何正常失败都会由 EXIT trap 写入 BUILD-INFO；这些默认值可区分“尚未走到
+# 产物门禁”与“产物缺失”，避免最终状态步骤只留下无上下文的 build_status=1。
+BUILD_PHASE="initialization"
+FAIL_REASON=""
+missing_artifacts="not-reached"
 
 # 首次建立诊断目录; 解析出源码后会清掉旧产物并重新初始化
 mkdir -p "$ART_DIR"
@@ -66,17 +71,20 @@ write_build_info() {
     echo "build_container=zxdong262/electerm-builder-legacy (Ubuntu 18.04 / Node 16 / GCC 8)"
     echo "max_glibc_ceiling=${MAX_GLIBC}"
     echo "max_glibcxx_ceiling=${MAX_GLIBCXX}"
+    echo "build_phase=${BUILD_PHASE}"
+    echo "failure_reason=${FAIL_REASON:-none}"
     echo "build_rc=${BUILD_RC}"
-    echo "missing_artifacts=${missing_artifacts:-unknown}"
+    echo "missing_artifacts=${missing_artifacts}"
     echo "glibc_verify_ok=${VERIFY_OK}"
   } > "$ART_DIR/BUILD-INFO.txt"
 }
 
-# sha256sum --check 必须能通过: 校验和文件自身不能出现在清单里, 否则
-# "先创建空文件 -> find 把它也算进去 -> 写入后内容变了" 会让校验永远 FAILED。
+# sha256sum --check 必须能通过: 校验和文件自身不能出现在清单里。BUILD-LOG.txt
+# 会持续被 tee 追加直到 EXIT trap 结束，也不能入清单，否则其摘要会立刻失效。
 write_checksums() {
   local tmp="$WORKSPACE/.sha256sums.tmp"
-  ( cd "$ART_DIR" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' \
+  ( cd "$ART_DIR" && find . -maxdepth 1 -type f \
+      ! -name 'SHA256SUMS.txt' ! -name 'BUILD-LOG.txt' \
       -printf '%P\n' | sort | xargs -r sha256sum ) > "$tmp"
   mv "$tmp" "$ART_DIR/SHA256SUMS.txt"
 }
@@ -104,6 +112,7 @@ on_exit() {
 trap on_exit EXIT
 
 fail() {
+  FAIL_REASON="$*"
   echo "FAIL: $*" >&2
   exit 1
 }
@@ -146,6 +155,8 @@ echo "electerm version: $ELECTERM_VERSION"
 find "$SRC_DIR" -maxdepth 1 -type d -name 'dist*' -exec rm -rf {} +
 rm -rf "$ART_DIR"
 mkdir -p "$ART_DIR"
+# 在清理成功后才开始镜像输出，避免旧运行日志混入本次 diagnostics artifact。
+exec > >(tee "$ART_DIR/BUILD-LOG.txt") 2>&1
 write_build_info
 
 # 修改依赖和构建配置前先备份源码文件。仓库内 vendored source/ 与 clone 两种
@@ -200,6 +211,7 @@ echo "================================================================"
 echo "[1/7] 降级依赖 (electron 22.3.27 / node-pty 0.10.1 / serialport 10.5.0 / vite 4)"
 echo "      原因: UOS 20 / Ubuntu 18 等旧 glibc 系统跑不了新版原生模块"
 echo "================================================================"
+BUILD_PHASE="dependency-rewrite"
 node -e "
 const fs = require('fs');
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
@@ -220,6 +232,7 @@ rm -f package-lock.json
 echo "================================================================"
 echo "[2/7] 安装 npm 依赖 (registry 抖动时自动重试)"
 echo "================================================================"
+BUILD_PHASE="npm-config"
 npm config set legacy-peer-deps true
 npm config set cache /tmp/.npm
 # 旧 Node 16 + 老 registry 组合下网络抖动很常见, 让 npm 自己多试几次,
@@ -228,6 +241,7 @@ npm config set fetch-retries 5
 npm config set fetch-retry-mintimeout 20000
 npm config set fetch-retry-maxtimeout 120000
 
+BUILD_PHASE="npm-install"
 npm_install_ok=0
 for attempt in 1 2 3; do
   echo "--- npm i (第 $attempt 次) ---"
@@ -240,21 +254,25 @@ for attempt in 1 2 3; do
 done
 [ "$npm_install_ok" -eq 1 ] || fail "npm i 连续 3 次失败, 见上方日志 (多为 registry 网络或某个依赖版本已下架)"
 
+BUILD_PHASE="electron-rebuild-install"
 npm i -S @electron/rebuild@3.7.2 || fail "安装 @electron/rebuild@3.7.2 失败"
 
 echo "================================================================"
 echo "[3/7] 编译应用 (npm run b = clean + compile + prepare-file)"
 echo "================================================================"
+BUILD_PHASE="application-compile"
 npm run b || fail "npm run b 失败 (前端编译或资源准备阶段)"
 
 echo "================================================================"
 echo "[4/7] 准备 electron-builder 配置 (npm run pb)"
 echo "================================================================"
+BUILD_PHASE="builder-configuration"
 npm run pb || fail "npm run pb 失败 (electron-builder 配置生成阶段)"
 
 echo "================================================================"
 echo "[5/7] 构建 legacy 安装包 (tar.gz / deb / rpm / AppImage)"
 echo "================================================================"
+BUILD_PHASE="package-build"
 if [ "$ARCH_TARGET" = "arm" ]; then
   # 上游 build-linux-arm-legacy.js 把 arm64 与 armv7l 混在同一进程中。armv7l
   # electron-rebuild 没有 catch, 一旦失败便以 RC=1 中止，导致已成功的 arm64 包
@@ -266,6 +284,7 @@ if [ "$ARCH_TARGET" = "arm" ]; then
 
   build_arm64_package() {
     local target="$1" install_src="$2"
+    BUILD_PHASE="package-${target}"
     echo "--- build arm64 ${target}: ${install_src} ---"
     rm -rf "$SRC_DIR/dist"
     if ! node - "$BUILDER_CONFIG" "$target" "$install_src" <<'NODE'
@@ -316,6 +335,7 @@ echo "打包步骤汇总退出码: RC=$BUILD_RC"
 echo "================================================================"
 echo "[6/7] 汇总并校验必需产物"
 echo "================================================================"
+BUILD_PHASE="artifact-gate"
 # x64 上游脚本仍使用 KEEP_FILE 保存到 dist*; arm64 已在每种格式完成时复制。
 if [ "$ARCH_TARGET" = "x64" ]; then
   for d in dist*/; do
@@ -357,6 +377,7 @@ echo "已汇总 $produced 个安装包; missing_artifacts=$missing_artifacts"
 echo "================================================================"
 echo "[7/7] glibc / libstdc++ 兼容性静态校验"
 echo "================================================================"
+BUILD_PHASE="abi-validation"
 # 解包每个 tar.gz, 扫描全部 ELF, 只统计实际需要的版本符号:
 #   - GLIBC_  上限不得超过 MAX_GLIBC (2.28), 否则 UOS 20 / Debian 10 加载不了
 #   - GLIBCXX_ 上限不得超过 MAX_GLIBCXX (3.4.25, 即 gcc 8 的 libstdc++)
@@ -420,6 +441,7 @@ else
 fi
 
 if [ "$BUILD_RC" -eq 0 ] && [ "$missing_artifacts" -eq 0 ] && [ "$VERIFY_OK" -eq 1 ]; then
+  BUILD_PHASE="complete"
   echo "0" > "$STATUS_FILE"
   echo "构建成功: 必需架构的 4 个目标均已生成并通过 glibc 兼容性校验"
 else
