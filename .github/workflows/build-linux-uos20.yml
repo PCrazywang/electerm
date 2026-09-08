@@ -1,24 +1,26 @@
 # =====================================================================
 # electerm ARM64 legacy 构建工作流 (UOS 20 / Ubuntu 兼容)
 # ---------------------------------------------------------------------
-# 单文件只配置一个架构 (arm64)；如需 x64 请复制本文件, 将 runner 改为
-# ubuntu-latest、构建参数改为 x64 (见 README)。
+# 单文件只配置一个架构 (arm64); 需要 x64 时复制本文件, 改 runner、--platform
+# 与构建参数三处即可 (见 README)。
 #
-# 结构 (参考 mysql 项目的 build-linux-uos20.yml):
-#   1) build        arm64 原生 runner 上, 宿主机跑 JS actions, 构建在
-#                   legacy 容器内 (docker run) 完成, 产物上传 artifact
-#   2) verify-uos20 在 Debian 10 (与 UOS 20 同为 glibc 2.28 基线) 上安装并
-#                   运行冒烟, 验证产物真能在老系统上跑
-#   3) release      推 v* tag 时把产物发布为 GitHub Release
+# 结构对齐 mysql/tag_v8.0.25/.github/workflows/build-linux-uos20.yml:
+#   1) build        arm64 原生 runner; JS actions 跑宿主机, 编译打包在 legacy
+#                   容器内 (docker run) 完成; 产物与状态文件上传 artifact
+#   2) verify-uos20 Debian 10 (与 UOS 20 同为 glibc 2.28 基线) 安装 deb、
+#                   逐个 ELF 查依赖、真实启动冒烟
+#   3) release      推 v* tag 时把已验证产物发布为 GitHub Release
 #
-# 为什么 legacy 构建 + docker run:
-#   electerm 的 node-pty / serialport 原生模块在新系统编译会链接新版 glibc
-#   符号, UOS 20 (glibc 2.28) 装不上; legacy 构建在 Ubuntu 18.04 (glibc 2.27)
-#   环境把 electron 降到 22.3.27、node-pty 0.10.1、serialport 10.5.0、vite 4。
-#   注意: legacy 容器 glibc 2.27 < node24 (JS actions 运行器) 要求的 2.28,
-#   所以不能把 job 的 container 设为该镜像, 必须宿主机 + docker run。
+# 三条关键约束 (改动前请先读):
+#   - legacy 镜像是 Ubuntu 18.04 (glibc 2.27), 低于 node24 运行器要求的 2.28,
+#     所以 build 任务不能用 container:, 必须宿主机 + docker run; 基线确认放在
+#     ci/build-legacy.sh 的 [0/7]。
+#   - 源码优先用仓库内 source/ (mysql 的 vendored 布局); 没有 source/ 时按
+#     pinned ref 从上游克隆, 因此缺目录不会直接让流水线失败。
+#   - 构建中途失败也要留下日志和已产出的包: 容器步骤 continue-on-error, 产物
+#     无条件上传, 任务红绿只由最后的「构建状态门禁」一步决定。
 #
-# 产物 (arm64 任务按官方脚本同时产出 armv7l, 可忽略):
+# 产物 (arm64 任务按官方脚本顺带产出 armv7l, 可忽略):
 #   arm64 : *-linux-arm64-legacy.deb / .tar.gz / .AppImage,
 #           *-linux-aarch64-legacy.rpm
 #   armv7l: *-linux-armv7l-legacy.deb / .tar.gz / .rpm / .AppImage
@@ -42,11 +44,11 @@ on:
   workflow_dispatch:
     inputs:
       electerm_ref:
-        description: 'Electerm branch or tag to build, for example v2.10.26'
+        description: '仓库内无 source/ 时从上游克隆的 tag/分支, 例如 v2.10.26'
         required: false
         type: string
       source_repo:
-        description: 'Source repository (owner/repo) to build, default official electerm/electerm'
+        description: '克隆来源 (owner/repo), 默认官方 electerm/electerm'
         required: false
         type: string
 
@@ -55,7 +57,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # 源码优先取仓库内的 source/ (与 mysql 项目 vendored 布局一致)
+  ELECTERM_SOURCE_DIR: source
+  # source/ 缺失时克隆的 ref; 同时作为版本记录写入 BUILD-INFO.txt
   ELECTERM_REF: v2.10.26
+  # legacy 构建镜像 (Ubuntu 18.04 / Node 16 / GCC 8), 必须带 linux/arm64 manifest
+  BUILDER_IMAGE: zxdong262/electerm-builder-legacy:latest
   # UOS 20 / Debian 10 / EL8 共享的 ABI 基线: glibc 2.28, libstdc++ (gcc 8) 3.4.25
   MAX_GLIBC: '2.28'
   MAX_GLIBCXX: '3.4.25'
@@ -67,54 +74,142 @@ jobs:
     timeout-minutes: 360
     env:
       PACKAGE_PLATFORM: arm64
+    # 下游任务直接使用解析出的源码版本; artifact 使用 run 唯一名, 即便源码
+    # 解析失败也能上传 artifacts/ 里的诊断文件。
+    outputs:
+      electerm_version: ${{ steps.resolve.outputs.version }}
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Resolve build inputs
+      # 源码解析: 先找仓库内 source/, 找不到再按 pinned ref 克隆上游。
+      # 版本号只从 package.json 读一次, 不在别处重复声明, 避免与真正编译的
+      # 源码脱节 (对应 mysql 的 "Resolve build inputs from the vendored source")。
+      - name: Resolve the electerm source tree
         id: resolve
         env:
           INPUT_REF: ${{ inputs.electerm_ref }}
-        run: |
-          set -eu
-          ref="$ELECTERM_REF"
-          if [ -n "${INPUT_REF:-}" ]; then
-            ref="$INPUT_REF"
-          fi
-          echo "ELECTERM_REF=$ref" >> "$GITHUB_ENV"
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-
-      - name: Clone electerm source
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_REPO: ${{ inputs.source_repo || 'electerm/electerm' }}
         run: |
           set -eu
-          rm -rf build_src
-          git clone --depth 1 --branch "$ELECTERM_REF" \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${SOURCE_REPO}.git" build_src
-          echo "--- 已检出 ---"
-          git -C build_src log -1 --oneline
+          ref="${INPUT_REF:-}"
+          [ -n "$ref" ] || ref="$ELECTERM_REF"
 
-      # 构建在 legacy 容器内进行 (基线确认见 ci/build-legacy.sh 的 [0/6])
+          # 允许 source/ 在仓库根, 也允许本目录作为 monorepo 的一层子目录
+          src=""
+          for candidate in \
+              "${GITHUB_WORKSPACE}/${ELECTERM_SOURCE_DIR}" \
+              "${GITHUB_WORKSPACE}/electerm/${ELECTERM_SOURCE_DIR}"; do
+            if [ -f "${candidate}/package.json" ] && [ -d "${candidate}/build/bin" ]; then
+              src="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$src" ]; then
+            source_kind="in-repo ${ELECTERM_SOURCE_DIR}/ @ ${GITHUB_SHA}"
+            echo "使用仓库内源码: $src"
+          else
+            echo "仓库内未找到 electerm 源码 (需要 package.json + build/bin), 改从上游克隆 ${SOURCE_REPO}@${ref}"
+            src="${GITHUB_WORKSPACE}/build_src"
+            rm -rf "$src"
+            # 公开仓库用匿名克隆: 不把本仓库 token 递给第三方 remote
+            cloned=0
+            for attempt in 1 2 3; do
+              if git clone --depth 1 --branch "$ref" \
+                  "https://github.com/${SOURCE_REPO}.git" "$src"; then
+                cloned=1
+                break
+              fi
+              echo "克隆第 ${attempt} 次失败, 15s 后重试" >&2
+              rm -rf "$src"
+              sleep 15
+            done
+            if [ "$cloned" -ne 1 ]; then
+              echo "无法克隆 ${SOURCE_REPO}@${ref}。私有源码请直接放进仓库的 ${ELECTERM_SOURCE_DIR}/ 目录。" >&2
+              exit 1
+            fi
+            git -C "$src" log -1 --oneline
+            source_kind="cloned ${SOURCE_REPO}@${ref}"
+          fi
+
+          if [ ! -f "$src/package.json" ]; then
+            echo "源码不完整: 缺少 $src/package.json" >&2
+            exit 1
+          fi
+          # legacy 打包脚本是官方 2.10.x 才有的; ref 太旧时在这里就说清楚
+          if [ ! -f "$src/build/bin/build-linux-arm-legacy.js" ]; then
+            echo "源码里没有 build/bin/build-linux-arm-legacy.js, 该 ref 还没有 legacy 构建脚本; 请用 v2.10.26 或更新版本。" >&2
+            ls -la "$src/build/bin" 2>/dev/null || true
+            exit 1
+          fi
+
+          version="$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).version)' "$src/package.json")"
+          [ -n "$version" ]
+
+          # 容器里工作区挂载为 /workspace, 所以传相对路径而不是宿主机绝对路径
+          src_rel="${src#"${GITHUB_WORKSPACE}/"}"
+
+          {
+            echo "ELECTERM_REF=$ref"
+            echo "ELECTERM_SRC_REL=$src_rel"
+            echo "ELECTERM_VERSION=$version"
+            echo "ELECTERM_SOURCE_KIND=$source_kind"
+          } >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          echo "electerm ${version} (${source_kind}), 容器内源码路径 /workspace/${src_rel}"
+
+      # 镜像必须真有 linux/arm64 manifest: 否则 docker run 会以一句很难读的
+      # "no matching manifest" 结束, 这里先拉取并把可用平台打印出来。
+      - name: Pull the legacy builder image for arm64
+        run: |
+          set -eu
+          pulled=0
+          for attempt in 1 2 3; do
+            if docker pull --platform linux/arm64 "$BUILDER_IMAGE"; then
+              pulled=1
+              break
+            fi
+            echo "拉取第 ${attempt} 次失败, 20s 后重试" >&2
+            sleep 20
+          done
+          if [ "$pulled" -ne 1 ]; then
+            echo "无法按 linux/arm64 拉取 ${BUILDER_IMAGE}。" >&2
+            echo "可能原因: Docker Hub 暂时不可达、限流，或镜像没有 ARM64 manifest。" >&2
+            echo "请在可联网环境运行: docker manifest inspect ${BUILDER_IMAGE}" >&2
+            echo "若镜像只有 amd64, 请改用 x64 工作流, 或换一个带 arm64 的 legacy 镜像。" >&2
+            exit 1
+          fi
+          arch="$(docker image inspect --format '{{.Architecture}}' "$BUILDER_IMAGE")"
+          echo "builder image architecture: $arch"
+          test "$arch" = "arm64"
+
+      # continue-on-error: 让「上传产物」和「构建状态门禁」两步一定能跑到。
+      # 构建脚本本身也保证正常失败路径会留下 build_status 与 artifacts/。
       - name: Build legacy packages in container (tar.gz/deb/rpm/AppImage)
+        id: container_build
+        continue-on-error: true
         env:
           USE_SYSTEM_FPM: "true"
           KEEP_FILE: "true"
         run: |
           docker run --rm --platform linux/arm64 \
             -v "${{ github.workspace }}:/workspace" -w /workspace \
-            -e ELECTERM_REF -e MAX_GLIBC -e MAX_GLIBCXX \
+            -e ELECTERM_REF -e ELECTERM_SRC_REL -e MAX_GLIBC -e MAX_GLIBCXX \
             -e USE_SYSTEM_FPM -e KEEP_FILE -e PACKAGE_PLATFORM \
-            zxdong262/electerm-builder-legacy:latest \
+            "$BUILDER_IMAGE" \
             bash /workspace/ci/build-legacy.sh arm
 
       - name: Upload build artifacts
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: electerm-legacy-arm64-armv7l
+          name: electerm-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts
-          if-no-files-found: error
+          # 构建失败时 artifacts/ 里可能只有 BUILD-INFO.txt, 甚至为空;
+          # 缺产物由下面的门禁步骤判定, 这里不要抢先把任务标红。
+          if-no-files-found: warn
           compression-level: 0
           retention-days: 14
 
@@ -122,19 +217,25 @@ jobs:
         if: always()
         run: |
           set -eu
+          echo "容器构建步骤结果: ${{ steps.container_build.outcome }}"
           if [ ! -f build_status ]; then
-            echo "未找到构建状态文件，构建未正常执行"
+            echo "未找到 build_status: 容器没能启动或脚本在最开始就中断, 请看上一步日志。" >&2
             exit 1
           fi
           status="$(cat build_status)"
+          echo "build_status=$status"
+          if [ -f artifacts/BUILD-INFO.txt ]; then
+            echo "--- BUILD-INFO.txt ---"
+            cat artifacts/BUILD-INFO.txt
+          fi
           if [ "$status" != "0" ]; then
-            echo "构建或 glibc 校验存在失败，请查看上方日志；已产出的包仍可下载"
+            echo "构建或 glibc 校验存在失败, 详见上方日志; 已产出的包仍可从 artifact 下载。" >&2
             exit 1
           fi
-          echo "构建完成：全部目标已生成并通过 glibc 兼容性校验"
+          echo "构建完成: 全部目标已生成并通过 glibc 兼容性校验"
 
-  # 产物在构建容器里只做了静态校验, 这里在真实的 UOS 20 ABI 基线
-  # (Debian 10, glibc 2.28) 上安装并启动, 验证能真正跑起来。
+  # 构建容器里只做了静态符号校验, 这里在真实的 UOS 20 ABI 基线 (Debian 10,
+  # glibc 2.28) 上安装并启动, 验证产物真能在老系统跑起来。
   verify-uos20:
     name: Verify Debian 10 (UOS 20 ABI)
     needs: build
@@ -143,34 +244,55 @@ jobs:
     timeout-minutes: 60
     env:
       DEBIAN_FRONTEND: noninteractive
+      ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
 
     steps:
       - name: Install Debian 10 runtime dependencies
         run: |
           set -eu
-          # buster 已归档, 改用 archive.debian.org 并关闭 Valid-Until 检查
+          # buster 已归档, 换 archive.debian.org 并关闭 Valid-Until 检查
           printf '%s\n' \
             'deb http://archive.debian.org/debian buster main' \
             'deb http://archive.debian.org/debian-security buster/updates main' \
             > /etc/apt/sources.list
           printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99archive
           apt-get -o Acquire::Check-Valid-Until=false update
+          # xauth 是 xvfb-run 的必需品, 而它只是 xvfb 的 Recommends,
+          # --no-install-recommends 下必须显式列出, 否则冒烟步骤起不来。
           apt-get install -y --no-install-recommends \
-            ca-certificates curl xz-utils xvfb procps
+            ca-certificates curl xz-utils xvfb xauth procps
 
-      - uses: actions/download-artifact@v7
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
         with:
-          name: electerm-legacy-arm64-armv7l
-          path: dist
+          name: electerm-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+
+      - name: Verify the downloaded artifact on the UOS 20 ABI baseline
+        run: |
+          set -eu
+          # JS actions may have run on the host; assert that this shell itself is
+          # really inside Debian 10 before accepting any compatibility result.
+          grep -q '^VERSION_ID="10"$' /etc/os-release
+          head -n 2 /etc/os-release
+          test "$(uname -m)" = "aarch64"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
+          cd dist
+          ls -lh
+          sha256sum --check SHA256SUMS.txt
+          deb="$(find . -name '*linux-arm64-legacy.deb' | head -n 1)"
+          if [ -z "$deb" ]; then
+            echo "artifact 里没有 arm64 legacy deb 包" >&2
+            exit 1
+          fi
+          echo "checking package metadata: $deb"
+          dpkg-deb --info "$deb" >/dev/null
+          dpkg-deb --contents "$deb" | head -n 20 || true
 
       - name: Install the deb on the UOS 20 ABI baseline
         run: |
           set -eu
-          head -n 2 /etc/os-release
-          test "$(uname -m)" = "aarch64"
-          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
           cd dist
-          sha256sum --check SHA256SUMS.txt
           deb="$(find . -name '*linux-arm64-legacy.deb' | head -n 1)"
           test -n "$deb"
           echo "installing: $deb"
@@ -178,30 +300,58 @@ jobs:
           apt-get install -y --no-install-recommends "./${deb#./}"
           test -x /opt/electerm/electerm
 
+          # 装上的版本必须与构建任务实际编译的版本一致
+          installed="$(dpkg-query --show --showformat='${Version}' electerm)"
+          echo "installed=$installed expected=$ELECTERM_VERSION"
+          case "$installed" in
+            "$ELECTERM_VERSION"*) ;;
+            *) echo "deb 版本与构建版本不一致" >&2; exit 1 ;;
+          esac
+
       - name: Verify every ELF dependency resolves on Debian 10
         run: |
           set -eu
-          # 不止主程序: electron 自带的 .so 与 app.asar.unpacked 里的原生
-          # 模块 (.node, node-pty/serialport) 也逐一检查
+          # 不止主程序: electron 自带的 .so 与 app.asar.unpacked 里的原生模块
+          # (node-pty / serialport 的 .node) 也逐一检查
           missing=0
-          for f in $(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \)); do
-            [ -f "$f" ] || continue
+          checked=0
+          while IFS= read -r f; do
+            checked=$((checked + 1))
             if ldd "$f" 2>/dev/null | grep -q 'not found'; then
               echo "Unresolved dependencies in $f" >&2
               ldd "$f" | grep 'not found' >&2
               missing=1
             fi
-          done
+          done <<EOF
+          $(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \))
+          EOF
+          echo "已检查 $checked 个 ELF 文件"
+          test "$checked" -gt 0
           test "$missing" -eq 0
 
-      - name: Smoke test (start electerm and read version)
+      - name: Smoke test (launch electerm under Xvfb)
         run: |
           set -eu
-          # 容器内以 root 运行需 --no-sandbox; xvfb 提供虚拟显示
-          out="$(timeout 90 xvfb-run -a /opt/electerm/electerm --no-sandbox --disable-gpu --version 2>&1 || true)"
-          echo "$out"
-          echo "$out" | grep -E '[0-9]+\.[0-9]+\.[0-9]+' >/dev/null \
-            || { echo "electerm 未输出版本号，冒烟失败" >&2; exit 1; }
+          # electerm 是 GUI 程序, --version 不保证被 main 进程处理, 所以只当
+          # 参考信息打印; 真正的判据是能在 glibc 2.28 上启动并持续运行。
+          echo "--- electerm --version (informational) ---"
+          timeout 90 xvfb-run -a /opt/electerm/electerm \
+            --no-sandbox --disable-gpu --version 2>&1 || true
+
+          log="/tmp/electerm-smoke.log"
+          rm -f "$log"
+          ( timeout 60 xvfb-run -a /opt/electerm/electerm \
+              --no-sandbox --disable-gpu >"$log" 2>&1 || true ) &
+          sleep 25
+          if pgrep -f '/opt/electerm/electerm' >/dev/null; then
+            echo "electerm 已启动并持续运行 25s, 冒烟通过"
+            pkill -f '/opt/electerm/electerm' || true
+            wait || true
+          else
+            echo "electerm 启动后立即退出, 冒烟失败; 以下为运行日志:" >&2
+            cat "$log" >&2 || true
+            exit 1
+          fi
 
   # 推 v* tag 时把已通过验证的产物发布为 GitHub Release
   release:
@@ -215,36 +365,40 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          name: electerm-legacy-arm64-armv7l
-          path: dist
+          name: electerm-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
 
       - name: Guard against mismatched version tags
         id: guard
+        env:
+          ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
         run: |
           set -eu
           tag="${GITHUB_REF#refs/tags/}"
-          # 从产物 BUILD-INFO.txt 读取实际构建的 electerm 版本
-          version="$(grep -h '^electerm_version=' dist/BUILD-INFO.txt 2>/dev/null \
-            | head -n 1 | cut -d= -f2 || true)"
-          test -n "$version"
           case "$tag" in
-            "v${version}") ;;
-            *) echo "Tag '${tag}' does not match built electerm version '${version}'; refusing to publish." >&2; exit 1 ;;
+            "v${ELECTERM_VERSION}") ;;
+            *) echo "Tag '${tag}' 与实际构建的 electerm 版本 '${ELECTERM_VERSION}' 不一致, 拒绝发布。" >&2; exit 1 ;;
           esac
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # 再和产物内的 BUILD-INFO.txt 对一次, 确认下载到的就是这次构建的包
+          built="$(sed -n 's/^electerm_version=//p' dist/BUILD-INFO.txt | head -n 1)"
+          if [ "$built" != "$ELECTERM_VERSION" ]; then
+            echo "BUILD-INFO.txt 记录的版本 '${built}' 与构建输出 '${ELECTERM_VERSION}' 不一致。" >&2
+            exit 1
+          fi
           echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          # gh 通过 git remote 推断目标仓库, 本任务无 checkout, 用 GH_REPO 显式指定
+          # gh 通过 git remote 推断目标仓库, 本任务没有 checkout, 用 GH_REPO 指定
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
-          ELECTERM_VERSION: ${{ steps.guard.outputs.version }}
+          ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
         run: |
           set -eu
-          assets="$(find dist -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
-            -o -name '*.tar.gz' -o -name 'SHA256SUMS.txt' \) | sort)"
+          assets="$(find dist -type f \( -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.AppImage' -o -name '*.tar.gz' -o -name 'SHA256SUMS.txt' \
+            -o -name 'BUILD-INFO.txt' \) | sort)"
           test -n "$assets"
           ls -lh $assets
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -254,8 +408,8 @@ jobs:
               --title "Electerm ${ELECTERM_VERSION}" \
               --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS 20 / Ubuntu compatible).
 
-            - Built on Ubuntu 18.04, glibc <= 2.28 baseline verified and installed on Debian 10 before publishing.
-            - See BUILD-INFO.txt inside each artifact for build environment details."
+          - Built on Ubuntu 18.04, glibc <= 2.28 baseline verified, installed and started on Debian 10 before publishing.
+          - See BUILD-INFO.txt for build environment details."
           fi
           gh release view "$RELEASE_TAG" \
             --json tagName,assets --jq '.tagName, (.assets[].name)'

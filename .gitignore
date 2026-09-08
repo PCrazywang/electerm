@@ -1,0 +1,3 @@
+# Local validation scratch directories (never needed by GitHub Actions)
+.depcheck/
+.yamlcheck/
