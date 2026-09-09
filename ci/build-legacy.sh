@@ -86,6 +86,7 @@ write_build_info() {
     echo "electron_cache=${ELECTRON_CACHE}"
     echo "npm_cache=${NPM_CACHE}"
     echo "workflow_name=${WORKFLOW_NAME}"
+    echo "package_lock_present=$(test -f "$SRC_DIR/package-lock.json" && echo yes || echo no)"
     echo "effective_uid=$(id -u)"
     echo "effective_gid=$(id -g)"
     echo "home=${HOME:-}"
@@ -248,7 +249,9 @@ if (pkg.devDependencies['@electerm/electerm-resource'] === '1.3.7') {
 }
 fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 " || fail "修改 package.json 失败"
-rm -f package-lock.json
+# 不删除上游 lockfile：它锁定了与 2.10.26 源码相匹配的纯 JS 依赖（尤其
+# trzsz2 的 cjs-full 导出）。native 依赖改写后由 npm install 按 lockfile 的
+# 既有依赖树补全更新；删除 lockfile 会解析到新版 trzsz2，导致运行时主进程崩溃。
 
 echo "================================================================"
 echo "[2/7] 安装 npm 依赖 (registry 抖动时自动重试)"
@@ -300,6 +303,24 @@ for attempt in 1 2 3; do
   sleep 30
 done
 [ "$npm_install_ok" -eq 1 ] || fail "npm i 连续 3 次失败, 见上方日志（可能是 registry 网络、依赖版本或 Node 版本兼容性）"
+
+# 2.10.26 主进程直接 require('trzsz2/cjs-full')；构建时把该导出作为门禁，
+# 防止包能启动但新建 SSH 会话时因 npm 解析到不兼容版本而崩溃。
+node - <<'NODE' || fail "trzsz2 版本与 electerm 2.10.26 不兼容：缺少 trzsz2/cjs-full 导出"
+const fs = require('fs');
+if (!fs.existsSync('node_modules/trzsz2/package.json')) {
+  console.error('trzsz2 dependency is missing after npm install');
+  process.exit(1);
+}
+const trzszPackage = JSON.parse(fs.readFileSync('node_modules/trzsz2/package.json', 'utf8'));
+try {
+  require.resolve('trzsz2/cjs-full');
+} catch (error) {
+  console.error(`trzsz2@${trzszPackage.version} does not export cjs-full`);
+  process.exit(1);
+}
+console.log(`trzsz2@${trzszPackage.version} exports cjs-full`);
+NODE
 
 BUILD_PHASE="electron-rebuild-install"
 npm i -S @electron/rebuild@3.7.2 || fail "安装 @electron/rebuild@3.7.2 失败"
