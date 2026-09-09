@@ -347,15 +347,21 @@ jobs:
           set -eu
           # GitHub 容器步骤默认用 /bin/sh 执行，故不用 Bash 专属的 process
           # substitution；临时文件收集清单，保持 POSIX shell 兼容。
-          # 只检查当前 Linux/arm64 可加载的 ELF。asar.unpacked 同时含 Android 等
-          # 其他平台的预编译 serialport 模块，它们不是本包在 Ubuntu/UOS ARM64 上会
-          # 加载的文件，拿它们跑 ldd 会产生无意义的 Android 库缺失。
+          # 只检查当前 Linux/arm64 可加载的 ELF。asar.unpacked 同时含 Android、
+          # Windows、macOS 等其他平台的预编译 serialport 模块；CPU 架构同为 AArch64
+          # 不代表它使用 Linux ABI，因此要先按路径排除这些 platform prebuilds。
           missing=0
           checked=0
           elf_list="$(mktemp)"
           trap 'rm -f "$elf_list"' EXIT
           find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \) > "$elf_list"
           while IFS= read -r f; do
+            case "$f" in
+              */prebuilds/android-*/*|*/prebuilds/darwin-*/*|*/prebuilds/win32-*/*)
+                echo "跳过非 Linux 平台预编译模块: $f"
+                continue
+                ;;
+            esac
             # readelf 属于 binutils；无该工具时所有文件都会被误判为 unknown。
             machine="$(readelf -h "$f" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
             case "$machine" in
