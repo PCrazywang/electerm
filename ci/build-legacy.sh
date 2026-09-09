@@ -329,7 +329,12 @@ if [ "$ARCH_TARGET" = "arm" ]; then
   [ -x "$BUILDER" ] || fail "electron-builder 不存在: $BUILDER"
   [ -f "$BUILDER_CONFIG" ] || fail "缺少 electron-builder 配置: $BUILDER_CONFIG"
 
-  build_arm64_package() {
+# electron-builder 在 GitHub Actions 中会自动推断发布模式。此脚本的职责只是生成
+# artifact，正式发布由 workflow 的 release job 在验证通过后用 gh release 完成。
+# 显式禁用 builder 发布，避免它因没有 GH_TOKEN 在“打包完成后”把所有格式判失败。
+BUILDER_PUBLISH_ARGS=(--publish never)
+
+build_arm64_package() {
     local target="$1" install_src="$2"
     BUILD_PHASE="package-${target}"
     echo "--- build arm64 ${target}: ${install_src} ---"
@@ -358,7 +363,7 @@ NODE
       echo "FAIL: 无法为 arm64 ${target} 更新 electron-builder 配置" >&2
       return 1
     fi
-    if "$BUILDER" --linux --arm64; then
+    if "$BUILDER" --linux --arm64 "${BUILDER_PUBLISH_ARGS[@]}"; then
       find "$SRC_DIR/dist" -maxdepth 1 -type f \
         \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.tar.gz' \) \
         -exec cp -v {} "$ART_DIR/" \;
