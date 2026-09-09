@@ -290,8 +290,11 @@ jobs:
           apt-get update
           # Ubuntu 20.04 的 --no-install-recommends 下，xauth 是 xvfb-run 的必需项，
           # 因此显式安装。
+          # deb 的依赖元数据未覆盖 Electron 在无桌面容器中实际加载的所有库；
+          # gbm/asound 是主进程所需，显式装入以让 ldd 与 Xvfb 冒烟检验真实运行路径。
           apt-get install -y --no-install-recommends \
-            ca-certificates curl xz-utils xvfb xauth procps
+            ca-certificates curl xz-utils xvfb xauth procps \
+            libasound2 libgbm1
 
       - name: Download build artifacts
         uses: actions/download-artifact@v7
@@ -342,20 +345,27 @@ jobs:
       - name: Verify every ELF dependency resolves in Ubuntu 20.04
         run: |
           set -eu
-          # 不止主程序: electron 自带的 .so 与 app.asar.unpacked 里的原生模块
-          # (node-pty / serialport 的 .node) 也逐一检查
+          # 只检查当前 Linux/arm64 可加载的 ELF。asar.unpacked 同时含 Android 等
+          # 其他平台的预编译 serialport 模块，它们不是本包在 Ubuntu/UOS ARM64 上会
+          # 加载的文件，拿它们跑 ldd 会产生无意义的 Android 库缺失。
           missing=0
           checked=0
-          while IFS= read -r f; do
+          while IFS= read -r -d '' f; do
+            machine="$(readelf -h "$f" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+            case "$machine" in
+              'AArch64') ;;
+              *)
+                echo "跳过非 Linux/arm64 ELF: $f (Machine: ${machine:-unknown})"
+                continue
+                ;;
+            esac
             checked=$((checked + 1))
             if ldd "$f" 2>/dev/null | grep -q 'not found'; then
               echo "Unresolved dependencies in $f" >&2
               ldd "$f" | grep 'not found' >&2
               missing=1
             fi
-          done <<EOF
-          $(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \))
-          EOF
+          done < <(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \) -print0)
           echo "已检查 $checked 个 ELF 文件"
           test "$checked" -gt 0
           test "$missing" -eq 0
