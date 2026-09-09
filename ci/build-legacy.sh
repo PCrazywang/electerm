@@ -39,13 +39,16 @@ ART_DIR="$WORKSPACE/artifacts"
 STATUS_FILE="$WORKSPACE/build_status"
 MAX_GLIBC="${MAX_GLIBC:-2.28}"
 MAX_GLIBCXX="${MAX_GLIBCXX:-3.4.25}"
-# electron@22 的 install.js 不读惯用的 ELECTRON_CACHE：它传给 @electron/get
-# 的是 electron_config_cache。@electron/get 只有环境变量 electron_config_cache
-# / npm_config_electron_config_cache 才会将 cacheRoot 改出 /root/.cache/electron。
-ELECTRON_CACHE="${ELECTRON_CACHE:-/tmp/electerm-electron-cache-$$}"
-export ELECTRON_CACHE
+# Electron 22 的 install.js 不读惯用的 ELECTRON_CACHE：它传给 @electron/get
+# 的是 electron_config_cache。所有缓存从同一根目录派生，容器工作流会将其挂载
+# 到与 npm 生命周期进程相同 UID/GID 可写的位置，避免镜像预置 /root 缓存的权限影响。
+ELECTERM_CACHE_ROOT="${ELECTERM_CACHE_ROOT:-/tmp/electerm-cache-$(id -u)}"
+ELECTRON_CACHE="${ELECTRON_CACHE:-${ELECTERM_CACHE_ROOT%/}/electron}"
+NPM_CACHE="${NPM_CACHE:-${npm_config_cache:-${ELECTERM_CACHE_ROOT%/}/npm}}"
+export ELECTERM_CACHE_ROOT ELECTRON_CACHE NPM_CACHE
 export electron_config_cache="$ELECTRON_CACHE"
 export npm_config_electron_config_cache="$ELECTRON_CACHE"
+export npm_config_cache="$NPM_CACHE"
 ELECTERM_VERSION="unknown"
 BUILD_RC=1
 VERIFY_OK=0
@@ -76,7 +79,10 @@ write_build_info() {
     echo "gcc=${gcc_info}"
     echo "node=${node_info}"
     echo "electron_cache=${ELECTRON_CACHE}"
-    echo "electron_config_cache=${electron_config_cache}"
+    echo "npm_cache=${NPM_CACHE}"
+    echo "effective_uid=$(id -u)"
+    echo "effective_gid=$(id -g)"
+    echo "home=${HOME:-}"
     echo "build_container=zxdong262/electerm-builder-legacy (Ubuntu 18.04 / Node 16 / GCC 8)"
     echo "max_glibc_ceiling=${MAX_GLIBC}"
     echo "max_glibcxx_ceiling=${MAX_GLIBCXX}"
@@ -242,15 +248,27 @@ echo "================================================================"
 echo "[2/7] 安装 npm 依赖 (registry 抖动时自动重试)"
 echo "================================================================"
 BUILD_PHASE="npm-config"
-# 不使用镜像预置的 /root/.cache/electron：其中若有不同 UID/权限留下的 zip，
-# electron@22 的 install.js 会在 stat 阶段 EACCES，npm 重试没有任何作用。
+# 缓存根可能是 workflow 预建的 workspace 挂载目录，不能 rm -rf 根目录，否则
+# Docker bind mount 的上层权限与诊断路径都可能被破坏。只清理本次 Electron 子缓存。
+mkdir -p "$ELECTERM_CACHE_ROOT" "$NPM_CACHE"
+chmod 700 "$ELECTERM_CACHE_ROOT" "$NPM_CACHE" 2>/dev/null || true
 rm -rf "$ELECTRON_CACHE"
 mkdir -p "$ELECTRON_CACHE"
-test -w "$ELECTRON_CACHE" || fail "Electron 缓存目录不可写: $ELECTRON_CACHE"
-echo "Electron cache: $ELECTRON_CACHE"
-echo "Electron installer cacheRoot: $electron_config_cache"
+chmod 700 "$ELECTRON_CACHE" 2>/dev/null || true
+cache_probe="$ELECTRON_CACHE/.write-probe-$$"
+echo "Cache identity: uid=$(id -u) gid=$(id -g) HOME=${HOME:-<unset>}"
+printf 'Electron cache: %s\nNpm cache: %s\n' "$ELECTRON_CACHE" "$NPM_CACHE"
+ls -ld "$ELECTERM_CACHE_ROOT" "$ELECTRON_CACHE" "$NPM_CACHE" || true
+if ! mkdir "$cache_probe"; then
+  fail "Electron 缓存不可创建子目录: $ELECTRON_CACHE (uid=$(id -u) gid=$(id -g)); 请检查 workflow 的 --user 与挂载目录所有权"
+fi
+if ! rmdir "$cache_probe"; then
+  fail "Electron 缓存探针无法清理: $cache_probe"
+fi
+# 容器的预置 /root/.cache/electron 可能有不同 UID/权限留下的 zip；Electron 22
+# 必须使用下方明确传入的 electron_config_cache，而不是镜像默认缓存。
 npm config set legacy-peer-deps true
-npm config set cache /tmp/.npm
+npm config set cache "$NPM_CACHE"
 # 旧 Node 16 + 老 registry 组合下网络抖动很常见, 让 npm 自己多试几次,
 # 外面再套一层整体重试; 否则一次 ECONNRESET 就是一次红叉。
 npm config set fetch-retries 5
@@ -261,14 +279,21 @@ BUILD_PHASE="npm-install"
 npm_install_ok=0
 for attempt in 1 2 3; do
   echo "--- npm i (第 $attempt 次) ---"
-  if npm i --cache /tmp/.npm; then
+  if npm i --cache "$NPM_CACHE"; then
     npm_install_ok=1
     break
+  fi
+  npm_eacces_logs="$(find "$NPM_CACHE/_logs" -type f -name '*-debug-0.log' \
+    -exec grep -lE 'EACCES.*(electron|cache)|EACCES: permission denied' {} + \
+    2>/dev/null || true)"
+  if [ -n "$npm_eacces_logs" ]; then
+    printf '%s\n' "$npm_eacces_logs" >&2
+    fail "npm i 因 Electron/npm 缓存权限被拒绝而失败; 检查上方 Cache identity、目录权限与 npm debug log（重试无法修复 EACCES）"
   fi
   echo "npm i 第 $attempt 次失败, 30s 后重试" >&2
   sleep 30
 done
-[ "$npm_install_ok" -eq 1 ] || fail "npm i 连续 3 次失败, 见上方日志 (多为 registry 网络或某个依赖版本已下架)"
+[ "$npm_install_ok" -eq 1 ] || fail "npm i 连续 3 次失败, 见上方日志（可能是 registry 网络、依赖版本或 Node 版本兼容性）"
 
 BUILD_PHASE="electron-rebuild-install"
 npm i -S @electron/rebuild@3.7.2 || fail "安装 @electron/rebuild@3.7.2 失败"

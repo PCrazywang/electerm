@@ -33,14 +33,14 @@ GitHub Actions 的 **JS actions（checkout / upload-artifact 等）在 job 容�
 
 因此 build 任务**不设 job 容器**：checkout、上传产物等 JS actions 跑在宿主机
 （node24 正常），真正编译打包在容器里通过 `docker run` 完成；基线确认也移进了
-`ci/build-legacy.sh` 的 `[0/7]`。verify 任务使用 `ubuntu:20.04` 用户态，因此也可以直接用 `container:`；但 Docker 容器共享 GitHub runner 的内核，不能将其视为 UOS 内核测试。
+`ci/build-legacy.sh` 的 `[0/7]`。verify 任务使用 `ubuntu:20.04` 用户态，因此也可以直接用 `container:`；但 Docker 容器共享 GitHub runner 的内核，这只是一项 Ubuntu 用户态冒烟检查，不能替代真实 UOS ARM64 安装验证。
 
 ## 工作流结构（对应 mysql 的 build-linux-uos20.yml）
 
 | 任务 | 做什么 | 对应 mysql |
 |---|---|---|
 | `build` | arm64 原生 runner（ubuntu-22.04-arm），宿主机跑 JS actions + `docker run` legacy 容器逐格式构建 arm64，明确门禁 tar.gz/deb/rpm/AppImage；即使失败也上传 `BUILD-INFO.txt` 诊断 artifact | `build` |
-| `verify-uos20` | 在 **Ubuntu 20.04 用户态**中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟；Docker 共享 runner 内核，不替代真实 UOS 测试 | `verify-uos20` |
+| `verify-ubuntu2004` | 在 **Ubuntu 20.04 用户态**中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟；这不是 UOS 运行时测试，发布前仍需真实 UOS ARM64 安装验证 | Ubuntu 20.04 用户态冒烟 |
 | `release` | 推 `v*` tag 时，把通过验证的产物发布为 GitHub Release（tag 与版本不符则拒绝） | `release` |
 
 **额外的 glibc 静态校验**（构建任务内）：解包每个 tar.gz，用 `readelf` 扫描全部 ELF
@@ -165,7 +165,7 @@ git tag v2.10.26
 git push origin v2.10.26
 ```
 
-- 发布前强制经过 build + verify-uos20 两个任务；
+- 发布前强制经过 build + verify-ubuntu2004 两个任务；
 - tag 与产物实际版本不符时（`BUILD-INFO.txt` 里的 `electerm_version`）会拒绝发布；
 - Release 已存在时只补充上传缺失资产（--clobber 覆盖同名）。
 
@@ -176,11 +176,11 @@ git push origin v2.10.26
 | 日志显示仓库没有 `source/` | 正常：工作流会自动从 `source_repo@electerm_ref` 克隆；若克隆也失败，检查 ref、仓库名与网络 |
 | `no matching manifest for linux/arm64` | legacy 镜像没有 ARM64 manifest；镜像预检会提前失败并显示可用平台，需改用带 ARM64 的镜像或改走 x64 工作流 |
 | 报 `No matching version found for @electerm/electerm-resource@1.3.7` | 该版本在 npm 不存在，`ci/build-legacy.sh` 会自动修正为 1.3.6；如源码引用其他失效版本，在脚本的依赖调整处固定到实际存在的版本 |
-| `electron` 安装报 `EACCES ... /root/.cache/electron/...zip` | legacy 镜像的预置 Electron 缓存存在错误权限。Electron 22 实际读取的是小写 `electron_config_cache`（不是常见的 `ELECTRON_CACHE`）；脚本已同时设置它和 npm 等价变量到可写的 `/tmp/electerm-electron-cache-*`。重新运行即可；若仍访问 `/root`，确认实际运行的是更新后的 `ci/build-legacy.sh` |
+| `electron` 安装报 `EACCES ... electron/...zip` 或 `EACCES ... .ci-electerm-cache/...` | 工作流会以工作区所有者运行容器，并将 `HOME`、npm 与 Electron 缓存统一到工作区的 `.ci-electerm-cache/`。下载 `BUILD-LOG.txt`，确认 `Cache identity` 与缓存目录权限；若嵌套写入探针失败，检查自托管 runner 的工作区挂载权限与 Docker UID/GID 映射，而不要依赖 npm 重试。 |
 | `actions/checkout@v6` 报 `GLIBC_2.28 not found` | build 任务误用了 glibc < 2.28 的 `container:`；必须保持宿主机 + `docker run`（本工作流已如此） |
 | `sha256sum --check` 校验 `SHA256SUMS.txt` 自身失败 | 使用旧脚本生成了自包含清单；当前脚本显式排除 `SHA256SUMS.txt`，重新构建即可 |
-| `verify-uos20` 的 `xvfb-run` 报 `xauth command not found` | Ubuntu 20.04 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
-| `verify-uos20` 装 deb 时 apt 报依赖缺失 | buster 仓库缺个别依赖（少见）；可改从 tar.gz 解压运行 |
+| `verify-ubuntu2004` 的 `xvfb-run` 报 `xauth command not found` | Ubuntu 20.04 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |
+| `verify-ubuntu2004` 装 deb 时 apt 报依赖缺失 | Ubuntu 20.04 仓库缺个别依赖（少见）；可改从 tar.gz 解压运行 |
 | 冒烟测试无版本号输出 | 看日志中 electerm 的报错；多为缺运行库，`apt install` 对应库后重跑 |
 | 构建任务在「检查构建状态」标红 | `container_build=success` 仅表示诊断脚本正常收尾。查看 `BUILD-INFO.txt` 的 `build_phase`、`failure_reason`、`build_rc`、`missing_artifacts`、`glibc_verify_ok`；同一 artifact 的 `BUILD-LOG.txt` 含完整容器日志，状态门禁也会打印其最后 200 行。当前流程逐格式构建 arm64，某一格式失败不会阻止其他格式上传，但缺任何一个必需文件仍会标红 |
 | Release 被拒绝发布 | tag 与 `BUILD-INFO.txt` 的 `electerm_version` 不一致；确认 tag 写成 `v<版本号>` |
@@ -190,6 +190,6 @@ git push origin v2.10.26
 ## 验证方式
 
 - 构建任务内：`readelf` 静态校验全部 ELF 的 glibc/libstdc++ 符号上限（≤ 2.28 / 3.4.25）；
-- 验证任务内：在 **Ubuntu 20.04 用户态**上 `apt` 安装 deb、`sha256sum` 校验、逐文件 `ldd` 检查依赖、启动冒烟；容器共享 runner 内核，因此真实 UOS 环境仍应补充实际安装验证；
+- 验证任务内：在 **Ubuntu 20.04 用户态**上 `apt` 安装 deb、`sha256sum` 校验、逐文件 `ldd` 检查依赖、启动冒烟；这是 Ubuntu 用户态证据，不能等同于 UOS 运行时验证，发布前仍应在真实 UOS 20 ARM64 环境实际安装；
 - 每次构建生成排除自身的 `SHA256SUMS.txt`，可在产物目录执行 `sha256sum -c SHA256SUMS.txt` 校验；
 - 建议在真机 UOS 20 / Ubuntu 上安装后做一次 SSH 连接冒烟测试。

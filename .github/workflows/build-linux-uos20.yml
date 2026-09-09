@@ -7,9 +7,9 @@
 # 结构对齐 mysql/tag_v8.0.25/.github/workflows/build-linux-uos20.yml:
 #   1) build        arm64 原生 runner; JS actions 跑宿主机, 编译打包在 legacy
 #                   容器内 (docker run) 完成; 产物与状态文件上传 artifact
-#   2) verify-uos20 Ubuntu 20.04 用户态安装 deb、逐个 ELF 查依赖、真实启动冒烟。
-#                   容器与宿主共享内核，不能把它当成 UOS 内核验证；UOS 的旧
-#                   glibc 兼容性由 build 中的静态符号上限强制保证。
+#   2) verify-ubuntu2004 Ubuntu 20.04 用户态安装 deb、逐个 ELF 查依赖、真实启动冒烟；
+#                   这是 Ubuntu 用户态检查，不是 UOS 运行时验证。
+#                   UOS 的旧 glibc 兼容性由 build 中的静态符号上限强制保证。
 #   3) release      推 v* tag 时把已验证产物发布为 GitHub Release
 #
 # 三条关键约束 (改动前请先读):
@@ -197,8 +197,31 @@ jobs:
           USE_SYSTEM_FPM: "true"
           KEEP_FILE: "true"
         run: |
+          set -eu
+          # npm 在 root 容器中执行生命周期脚本时会降权为源码目录的所有者。若缓存
+          # 由 root 在 /tmp 建立，Electron install.js 就会在创建 hash 子目录时 EACCES。
+          # 让容器从一开始即以工作区所有者运行，并把 HOME/npm/Electron 缓存统一放
+          # 到该用户可写的挂载工作区，避免镜像预置 /root/.cache 的权限影响。
+          container_uid="$(id -u)"
+          container_gid="$(id -g)"
+          cache_root="${GITHUB_WORKSPACE}/.ci-electerm-cache"
+          home_dir="${GITHUB_WORKSPACE}/.ci-electerm-home"
+          rm -rf "$cache_root" "$home_dir"
+          mkdir -p "$cache_root/electron" "$cache_root/npm" "$home_dir"
+          chmod 700 "$cache_root" "$cache_root/electron" "$cache_root/npm" "$home_dir"
+          printf 'host build identity: uid=%s gid=%s\n' "$container_uid" "$container_gid"
+          printf 'cache root: %s\n' "$cache_root"
+
           docker run --rm --platform linux/arm64 \
+            --user "${container_uid}:${container_gid}" \
             -v "${{ github.workspace }}:/workspace" -w /workspace \
+            -e HOME=/workspace/.ci-electerm-home \
+            -e ELECTERM_CACHE_ROOT=/workspace/.ci-electerm-cache \
+            -e ELECTRON_CACHE=/workspace/.ci-electerm-cache/electron \
+            -e electron_config_cache=/workspace/.ci-electerm-cache/electron \
+            -e npm_config_electron_config_cache=/workspace/.ci-electerm-cache/electron \
+            -e NPM_CACHE=/workspace/.ci-electerm-cache/npm \
+            -e npm_config_cache=/workspace/.ci-electerm-cache/npm \
             -e ELECTERM_REF -e ELECTERM_SRC_REL -e MAX_GLIBC -e MAX_GLIBCXX \
             -e USE_SYSTEM_FPM -e KEEP_FILE -e PACKAGE_PLATFORM \
             "$BUILDER_IMAGE" \
@@ -244,10 +267,13 @@ jobs:
           echo "构建完成: 全部目标已生成并通过 glibc 兼容性校验"
 
   # 构建容器只做静态符号校验；这里使用 Ubuntu 20.04 用户态安装并启动 deb，
-  # 验证动态依赖与 GUI 主进程。Docker 容器共享 GitHub runner 内核，不能将本
-  # 检查表述为 UOS 内核验证；UOS 旧 glibc 兼容性由 build 中的符号上限保证。
-  verify-uos20:
-    name: Verify Ubuntu 20.04 (UOS 20 runtime)
+  # 验证动态依赖与 GUI 主进程。容器共享 GitHub runner 内核，不能将本检查视为
+  # UOS 运行时验证；UOS 旧 glibc 兼容性由 build 中的符号上限保证，发布前仍须
+  # 在真实 UOS ARM64 环境安装验证。
+  # 需要真实 UOS 运行时验证时，应在 UOS ARM64 自托管 runner/VM 上补充验证；本任务
+  # 仅为 Ubuntu 20.04 用户态安装、依赖检查和 GUI 启动冒烟。
+  verify-ubuntu2004:
+    name: Smoke test in Ubuntu 20.04 userspace
     needs: build
     runs-on: ubuntu-22.04-arm
     container: ubuntu:20.04
@@ -360,7 +386,7 @@ jobs:
   # 推 v* tag 时把已通过验证的产物发布为 GitHub Release
   release:
     name: Publish GitHub Release
-    needs: [build, verify-uos20]
+    needs: [build, verify-ubuntu2004]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -410,9 +436,10 @@ jobs:
           else
             gh release create "$RELEASE_TAG" $assets \
               --title "Electerm ${ELECTERM_VERSION}" \
-              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS 20 / Ubuntu compatible).
+              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS-compatible ABI target).
 
           - Built on Ubuntu 18.04; legacy ABI ceilings are statically verified, then the package is installed and started in Ubuntu 20.04 userspace before publishing.
+          - The Ubuntu container smoke test is not a UOS runtime test; validate on real UOS ARM64 before claiming runtime support.
           - See BUILD-INFO.txt for build environment details."
           fi
           gh release view "$RELEASE_TAG" \
