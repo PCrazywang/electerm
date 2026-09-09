@@ -293,7 +293,7 @@ jobs:
           # deb 的依赖元数据未覆盖 Electron 在无桌面容器中实际加载的所有库；
           # gbm/asound 是主进程所需，显式装入以让 ldd 与 Xvfb 冒烟检验真实运行路径。
           apt-get install -y --no-install-recommends \
-            ca-certificates curl xz-utils xvfb xauth procps \
+            binutils ca-certificates curl xz-utils xvfb xauth procps \
             libasound2 libgbm1
 
       - name: Download build artifacts
@@ -356,6 +356,7 @@ jobs:
           trap 'rm -f "$elf_list"' EXIT
           find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \) > "$elf_list"
           while IFS= read -r f; do
+            # readelf 属于 binutils；无该工具时所有文件都会被误判为 unknown。
             machine="$(readelf -h "$f" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
             case "$machine" in
               'AArch64') ;;
