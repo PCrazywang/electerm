@@ -177,6 +177,7 @@ git push origin v2.10.26
 | `no matching manifest for linux/arm64` | legacy 镜像没有 ARM64 manifest；镜像预检会提前失败并显示可用平台，需改用带 ARM64 的镜像或改走 x64 工作流 |
 | 报 `No matching version found for @electerm/electerm-resource@1.3.7` | 该版本在 npm 不存在，`ci/build-legacy.sh` 会自动修正为 1.3.6；如源码引用其他失效版本，在脚本的依赖调整处固定到实际存在的版本 |
 | `electron` 安装报 `EACCES ... electron/...zip` 或 `EACCES ... .ci-electerm-cache/...` | 工作流会以工作区所有者运行容器，并将 `HOME`、npm 与 Electron 缓存统一到工作区的 `.ci-electerm-cache/`。下载 `BUILD-LOG.txt`，确认 `Cache identity` 与缓存目录权限；若嵌套写入探针失败，检查自托管 runner 的工作区挂载权限与 Docker UID/GID 映射，而不要依赖 npm 重试。 |
+| `electron-builder` 报 `cannot expand pattern "${env.WORKFLOW_NAME}"` | 上游生成的 `electron-builder.json` 使用 `WORKFLOW_NAME` 作为构建元数据。本 CI 逐格式直接调用 builder，已在容器与脚本中固定传入 `electerm-linux-arm64-legacy`；若仍报错，确认日志的 `WORKFLOW_NAME:` 行不是空值，并确认 Actions 正在运行包含该修复的提交。 |
 | `actions/checkout@v6` 报 `GLIBC_2.28 not found` | build 任务误用了 glibc < 2.28 的 `container:`；必须保持宿主机 + `docker run`（本工作流已如此） |
 | `sha256sum --check` 校验 `SHA256SUMS.txt` 自身失败 | 使用旧脚本生成了自包含清单；当前脚本显式排除 `SHA256SUMS.txt`，重新构建即可 |
 | `verify-ubuntu2004` 的 `xvfb-run` 报 `xauth command not found` | Ubuntu 20.04 使用 `--no-install-recommends` 时要显式安装 `xauth`（本工作流已列出） |

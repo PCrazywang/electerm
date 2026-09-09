@@ -222,6 +222,7 @@ jobs:
             -e npm_config_electron_config_cache=/workspace/.ci-electerm-cache/electron \
             -e NPM_CACHE=/workspace/.ci-electerm-cache/npm \
             -e npm_config_cache=/workspace/.ci-electerm-cache/npm \
+            -e WORKFLOW_NAME=electerm-linux-arm64-legacy \
             -e ELECTERM_REF -e ELECTERM_SRC_REL -e MAX_GLIBC -e MAX_GLIBCXX \
             -e USE_SYSTEM_FPM -e KEEP_FILE -e PACKAGE_PLATFORM \
             "$BUILDER_IMAGE" \

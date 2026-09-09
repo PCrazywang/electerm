@@ -49,6 +49,11 @@ export ELECTERM_CACHE_ROOT ELECTRON_CACHE NPM_CACHE
 export electron_config_cache="$ELECTRON_CACHE"
 export npm_config_electron_config_cache="$ELECTRON_CACHE"
 export npm_config_cache="$NPM_CACHE"
+# prepare-electron-build.js 保留了上游 electron-builder.json 中的
+# ${env.WORKFLOW_NAME}。本 CI 不经由上游组合脚本启动，因此必须显式提供
+# 一个稳定名称；否则 electron-builder 在读取配置时会直接拒绝打包。
+WORKFLOW_NAME="${WORKFLOW_NAME:-electerm-linux-arm64-legacy}"
+export WORKFLOW_NAME
 ELECTERM_VERSION="unknown"
 BUILD_RC=1
 VERIFY_OK=0
@@ -80,6 +85,7 @@ write_build_info() {
     echo "node=${node_info}"
     echo "electron_cache=${ELECTRON_CACHE}"
     echo "npm_cache=${NPM_CACHE}"
+    echo "workflow_name=${WORKFLOW_NAME}"
     echo "effective_uid=$(id -u)"
     echo "effective_gid=$(id -g)"
     echo "home=${HOME:-}"
@@ -257,7 +263,7 @@ mkdir -p "$ELECTRON_CACHE"
 chmod 700 "$ELECTRON_CACHE" 2>/dev/null || true
 cache_probe="$ELECTRON_CACHE/.write-probe-$$"
 echo "Cache identity: uid=$(id -u) gid=$(id -g) HOME=${HOME:-<unset>}"
-printf 'Electron cache: %s\nNpm cache: %s\n' "$ELECTRON_CACHE" "$NPM_CACHE"
+printf 'Electron cache: %s\nNpm cache: %s\nWORKFLOW_NAME: %s\n' "$ELECTRON_CACHE" "$NPM_CACHE" "$WORKFLOW_NAME"
 ls -ld "$ELECTERM_CACHE_ROOT" "$ELECTRON_CACHE" "$NPM_CACHE" || true
 if ! mkdir "$cache_probe"; then
   fail "Electron 缓存不可创建子目录: $ELECTRON_CACHE (uid=$(id -u) gid=$(id -g)); 请检查 workflow 的 --user 与挂载目录所有权"
