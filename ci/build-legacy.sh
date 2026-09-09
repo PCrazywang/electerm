@@ -241,6 +241,9 @@ pkg.devDependencies.electron = '22.3.27';
 pkg.devDependencies['@electron/rebuild'] = '3.7.2';
 pkg.dependencies['node-pty'] = '0.10.1';
 pkg.dependencies.serialport = '10.5.0';
+// 2.10.26 的 IPC 主进程 require('trzsz2/cjs-full')。上游 tag 锁定的 1.0.1
+// 导出该路径；不能保留 ^ 范围让 npm 在 legacy 依赖变更时解析到不兼容版本。
+pkg.dependencies.trzsz2 = '1.0.1';
 pkg.devDependencies.vite = '4';
 // @electerm/electerm-resource@1.3.7 在 npm registry 上不存在 (1.3.6 之后直接
 // 跳到 2.x), 而 2.10.26 的 package.json 引用了它; 就近修正为同系列的 1.3.6。
@@ -249,9 +252,24 @@ if (pkg.devDependencies['@electerm/electerm-resource'] === '1.3.7') {
 }
 fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 " || fail "修改 package.json 失败"
-# 不删除上游 lockfile：它锁定了与 2.10.26 源码相匹配的纯 JS 依赖（尤其
-# trzsz2 的 cjs-full 导出）。native 依赖改写后由 npm install 按 lockfile 的
-# 既有依赖树补全更新；删除 lockfile 会解析到新版 trzsz2，导致运行时主进程崩溃。
+# package-lock 记录原始 ^1.0.1 范围的解析结果；依赖改写后 npm install 会更新
+# lockfile，故在此把生产依赖锁定为 Electron 22/Node 16 可运行的确切版本。
+node - <<'NODE' || fail "无法将 trzsz2 锁定为 1.0.1"
+const fs = require('fs');
+if (!fs.existsSync('package-lock.json')) process.exit(0);
+const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+const root = lock.packages && lock.packages[''];
+if (root && root.dependencies && root.dependencies.trzsz2) root.dependencies.trzsz2 = '1.0.1';
+const entry = lock.packages && lock.packages['node_modules/trzsz2'];
+if (entry) {
+  entry.version = '1.0.1';
+  entry.resolved = 'https://registry.npmjs.org/trzsz2/-/trzsz2-1.0.1.tgz';
+}
+if (lock.dependencies && lock.dependencies.trzsz2) lock.dependencies.trzsz2.version = '1.0.1';
+fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n');
+NODE
+# 不删除上游 lockfile；此外显式固定 trzsz2@1.0.1，因为 Electron 22/Node 16
+# 构建会改写 npm 的依赖树，单靠原 lockfile 不能保证 package 的最终导出兼容。
 
 echo "================================================================"
 echo "[2/7] 安装 npm 依赖 (registry 抖动时自动重试)"
@@ -313,6 +331,10 @@ if (!fs.existsSync('node_modules/trzsz2/package.json')) {
   process.exit(1);
 }
 const trzszPackage = JSON.parse(fs.readFileSync('node_modules/trzsz2/package.json', 'utf8'));
+if (trzszPackage.version !== '1.0.1') {
+  console.error(`expected trzsz2@1.0.1, found ${trzszPackage.version}`);
+  process.exit(1);
+}
 try {
   require.resolve('trzsz2/cjs-full');
 } catch (error) {
@@ -322,8 +344,17 @@ try {
 console.log(`trzsz2@${trzszPackage.version} exports cjs-full`);
 NODE
 
-BUILD_PHASE="electron-rebuild-install"
-npm i -S @electron/rebuild@3.7.2 || fail "安装 @electron/rebuild@3.7.2 失败"
+# 安装 @electron/rebuild 时不允许它重解析生产依赖；否则可能把刚检查过的
+# trzsz2@1.0.1 替换为不导出 cjs-full 的版本并在打包后留下坏应用。
+npm i --save-dev --package-lock=false --ignore-scripts @electron/rebuild@3.7.2 \
+  || fail "安装 @electron/rebuild@3.7.2 失败"
+node - <<'NODE' || fail "安装 @electron/rebuild 后 trzsz2 被替换为不兼容版本"
+const fs = require('fs');
+const version = JSON.parse(fs.readFileSync('node_modules/trzsz2/package.json', 'utf8')).version;
+if (version !== '1.0.1') throw new Error(`expected trzsz2@1.0.1, found ${version}`);
+require.resolve('trzsz2/cjs-full');
+console.log('trzsz2@1.0.1 cjs-full remains resolvable after electron rebuild install');
+NODE
 
 echo "================================================================"
 echo "[3/7] 编译应用 (npm run b = clean + compile + prepare-file)"
