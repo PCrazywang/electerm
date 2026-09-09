@@ -345,12 +345,17 @@ jobs:
       - name: Verify every ELF dependency resolves in Ubuntu 20.04
         run: |
           set -eu
+          # GitHub 容器步骤默认用 /bin/sh 执行，故不用 Bash 专属的 process
+          # substitution；临时文件收集清单，保持 POSIX shell 兼容。
           # 只检查当前 Linux/arm64 可加载的 ELF。asar.unpacked 同时含 Android 等
           # 其他平台的预编译 serialport 模块，它们不是本包在 Ubuntu/UOS ARM64 上会
           # 加载的文件，拿它们跑 ldd 会产生无意义的 Android 库缺失。
           missing=0
           checked=0
-          while IFS= read -r -d '' f; do
+          elf_list="$(mktemp)"
+          trap 'rm -f "$elf_list"' EXIT
+          find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \) > "$elf_list"
+          while IFS= read -r f; do
             machine="$(readelf -h "$f" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
             case "$machine" in
               'AArch64') ;;
@@ -365,7 +370,7 @@ jobs:
               ldd "$f" | grep 'not found' >&2
               missing=1
             fi
-          done < <(find /opt/electerm -type f \( -name '*.so*' -o -name '*.node' -o -name 'electerm' \) -print0)
+          done < "$elf_list"
           echo "已检查 $checked 个 ELF 文件"
           test "$checked" -gt 0
           test "$missing" -eq 0
