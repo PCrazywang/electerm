@@ -440,7 +440,7 @@ jobs:
           fi
           echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update the GitHub Release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           # gh 通过 git remote 推断目标仓库, 本任务没有 checkout, 用 GH_REPO 指定
@@ -449,21 +449,43 @@ jobs:
           ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
         run: |
           set -eu
-          assets="$(find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \
-            -o -name '*.AppImage' -o -name '*.tar.gz' -o -name 'SHA256SUMS.txt' \
-            -o -name 'BUILD-INFO.txt' \) | sort)"
-          test -n "$assets"
-          ls -lh $assets
+          assets=(
+            "$(find artifacts -maxdepth 1 -type f -name "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.deb" -print -quit)"
+            "$(find artifacts -maxdepth 1 -type f -name "electerm-${ELECTERM_VERSION}-linux-aarch64-legacy.rpm" -print -quit)"
+            "$(find artifacts -maxdepth 1 -type f -name "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.AppImage" -print -quit)"
+            "$(find artifacts -maxdepth 1 -type f -name "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.tar.gz" -print -quit)"
+            "artifacts/SHA256SUMS.txt"
+            "artifacts/BUILD-INFO.txt"
+          )
+          for asset in "${assets[@]}"; do
+            test -n "$asset"
+            test -f "$asset"
+          done
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" $assets --clobber
-          else
-            gh release create "$RELEASE_TAG" $assets \
-              --title "Electerm ${ELECTERM_VERSION}" \
-              --notes "Automated release of electerm ${ELECTERM_VERSION} (legacy arm64, UOS-compatible ABI target).
-
-          - Built on Ubuntu 18.04; legacy ABI ceilings are statically verified, then the package is installed and started in Ubuntu 20.04 userspace before publishing.
-          - The Ubuntu container smoke test is not a UOS runtime test; validate on real UOS ARM64 before claiming runtime support.
-          - See BUILD-INFO.txt for build environment details."
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite published assets." >&2
+            exit 1
           fi
-          gh release view "$RELEASE_TAG" \
-            --json tagName,assets --jq '.tagName, (.assets[].name)'
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --title "Electerm ${ELECTERM_VERSION}" \
+            --generate-notes
+
+      - name: Validate generated release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
+          ELECTERM_VERSION: ${{ needs.build.outputs.electerm_version }}
+        run: |
+          set -eu
+          expected_assets=(
+            "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.deb"
+            "electerm-${ELECTERM_VERSION}-linux-aarch64-legacy.rpm"
+            "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.AppImage"
+            "electerm-${ELECTERM_VERSION}-linux-arm64-legacy.tar.gz"
+            "SHA256SUMS.txt"
+            "BUILD-INFO.txt"
+          )
+          actual_assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for asset in "${expected_assets[@]}"; do
+            printf '%s\n' "$actual_assets" | grep -Fx -- "$asset" >/dev/null
+          done

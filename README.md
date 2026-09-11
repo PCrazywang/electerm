@@ -41,7 +41,7 @@ GitHub Actions 的 **JS actions（checkout / upload-artifact 等）在 job 容�
 |---|---|---|
 | `build` | arm64 原生 runner（ubuntu-22.04-arm），宿主机跑 JS actions + `docker run` legacy 容器逐格式构建 arm64，明确门禁 tar.gz/deb/rpm/AppImage；即使失败也上传 `BUILD-INFO.txt` 诊断 artifact | `build` |
 | `verify-ubuntu2004` | 在 **Ubuntu 20.04 用户态**中 `apt` 安装 deb、检查全部 ELF 依赖、启动冒烟；这不是 UOS 运行时测试，发布前仍需真实 UOS ARM64 安装验证 | Ubuntu 20.04 用户态冒烟 |
-| `release` | 推 `v*` tag 时，把通过验证的产物发布为 GitHub Release（tag 与版本不符则拒绝） | `release` |
+| `release` | 推 `v*` tag 时，把通过验证的预期产物创建为 GitHub Release（tag 与版本不符则拒绝；已存在同名 Release 时拒绝覆盖） | `release` |
 
 **额外的 glibc 静态校验**（构建任务内）：解包每个 tar.gz，用 `readelf` 扫描全部 ELF
 的 **UND 符号**，要求 `GLIBC_ ≤ 2.28`、`GLIBCXX_ ≤ 3.4.25`、且不引用
@@ -167,7 +167,7 @@ git push origin v2.10.26
 
 - 发布前强制经过 build + verify-ubuntu2004 两个任务；
 - tag 与产物实际版本不符时（`BUILD-INFO.txt` 里的 `electerm_version`）会拒绝发布；
-- Release 已存在时只补充上传缺失资产（--clobber 覆盖同名）。
+- Release 使用 GitHub 自动生成的说明，只上传 4 个 arm64 legacy 安装包、`SHA256SUMS.txt` 与 `BUILD-INFO.txt`；若同名 Release 已存在，流程会失败而不会覆盖已发布资产。
 
 ## 故障排查
 
